@@ -16,9 +16,9 @@ wire as decimal.Decimal (integral ones as int), and FLOAT/DOUBLE/REAL as float.
 A multi-statement execute() exposes the first result set; step to the rest with
 cursor.nextset().
 
-The connection starts in autocommit mode, matching the Snowflake Python connector's
-behavior rather than strict DB-API default; set conn.autocommit = False (or call
-conn.begin()) for explicit transactions.
+The connection starts in autocommit mode rather than the strict DB-API default; set
+conn.autocommit = False (or call conn.begin()) for explicit transactions. With it off
+the connection stays transactional: ending one transaction opens the next.
 """
 
 import datetime as _dt
@@ -30,7 +30,7 @@ import urllib.error as _urlerror
 import urllib.parse as _urlparse
 import urllib.request as _urlrequest
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 apilevel = "2.0"
 threadsafety = 1
@@ -194,7 +194,13 @@ class Connection(object):
         self._timeout = timeout
         self._session_id = None
         self._closed = False
-        self.autocommit = True
+        # The engine only treats work as transactional after an explicit BEGIN, so the
+        # three pieces of state are: what the caller asked for, whether a transaction is
+        # actually open, and whether one still has to be opened before the next
+        # statement. Ending a transaction while autocommit is off arms the next.
+        self._autocommit = True
+        self._in_transaction = False
+        self._begin_pending = False
         self._pending_use = []
         if database:
             self._pending_use.append("USE DATABASE " + _quote_ident(database))
@@ -203,25 +209,51 @@ class Connection(object):
 
     # -- PEP 249 surface ----------------------------------------------------
 
+    @property
+    def autocommit(self):
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, value):
+        wanted = bool(value)
+        if wanted == self._autocommit:
+            return
+        self._autocommit = wanted
+        if wanted:
+            self._end_transaction("COMMIT")
+            self._begin_pending = False
+        else:
+            self._begin_pending = True
+
     def cursor(self):
         self._check_open()
         return Cursor(self)
 
     def commit(self):
         self._check_open()
-        if not self.autocommit:
-            self._execute_raw("COMMIT")
+        self._end_transaction("COMMIT")
+        self._begin_pending = not self._autocommit
 
     def rollback(self):
         self._check_open()
-        if not self.autocommit:
-            self._execute_raw("ROLLBACK")
+        self._end_transaction("ROLLBACK")
+        self._begin_pending = not self._autocommit
 
     def begin(self):
         """Start an explicit transaction (disables autocommit for this connection)."""
         self._check_open()
-        self.autocommit = False
+        # Send the DSN's USE statements first. Run inside the transaction they would
+        # implicitly commit it, quietly losing everything that followed.
+        self._drain_pending_use()
+        self._autocommit = False
+        self._begin_pending = False
         self._execute_raw("BEGIN")
+        self._in_transaction = True
+
+    def _end_transaction(self, statement):
+        if self._in_transaction:
+            self._in_transaction = False
+            self._execute_raw(statement)
 
     def close(self):
         self._closed = True
@@ -245,10 +277,17 @@ class Connection(object):
         if self._closed:
             raise InterfaceError("connection is closed")
 
-    def _execute(self, sql):
-        self._check_open()
+    def _drain_pending_use(self):
         while self._pending_use:
             self._execute_raw(self._pending_use.pop(0))
+
+    def _execute(self, sql):
+        self._check_open()
+        self._drain_pending_use()
+        if self._begin_pending:
+            self._begin_pending = False
+            self._execute_raw("BEGIN")
+            self._in_transaction = True
         return self._execute_raw(sql)
 
     def _execute_raw(self, sql):
@@ -347,7 +386,8 @@ class Cursor(object):
     def fetchmany(self, size=None):
         self._check_open()
         self._check_executed()
-        n = size or self.arraysize
+        # size=0 means zero rows; only an omitted size falls back to arraysize.
+        n = self.arraysize if size is None else size
         out = self._rows[self._pos:self._pos + n]
         self._pos += len(out)
         return out
@@ -424,14 +464,45 @@ class Cursor(object):
                                       scales[i] if i < len(scales) else 0))
             rows.append(tuple(cells))
         self._rows = rows
-        # DML answers with a one-cell "number of rows ..." result; surface it as rowcount.
-        if (len(columns) == 1 and len(self._rows) == 1
-                and str(columns[0].get("name", "")).lower().startswith("number of rows")):
-            self.rowcount = int(self._rows[0][0])
+        # DML answers with a status row of counters rather than data; surface it as
+        # rowcount and hand back an empty result set.
+        if len(self._rows) == 1 and _is_dml_status(columns):
+            self.rowcount = _dml_rowcount(columns, self._rows[0])
             self.description = None
             self._rows = []
         else:
             self.rowcount = len(self._rows)
+
+
+# -- DML status rows --------------------------------------------------------
+
+def _is_dml_status(columns):
+    """Whether a result set is a DML status row rather than data.
+
+    The protocol carries no statement type, so this goes by shape: DML answers with a
+    single row whose every column is a "number of ..." counter. INSERT and DELETE report
+    one; UPDATE adds "number of multi-joined rows updated", and MERGE reports both an
+    inserted and an updated count.
+    """
+    if not columns:
+        return False
+    for column in columns:
+        if not str(column.get("name") or "").lower().startswith("number of "):
+            return False
+    return True
+
+
+def _dml_rowcount(columns, row):
+    """Total rows affected. "number of multi-joined rows updated" is a diagnostic
+    sub-count of the rows already counted as updated, so it is deliberately left out."""
+    total = 0
+    for index, column in enumerate(columns):
+        name = str(column.get("name") or "").lower()
+        if name.startswith("number of rows ") and index < len(row):
+            value = row[index]
+            if value is not None:
+                total += int(value)
+    return total
 
 
 # -- value conversion -------------------------------------------------------
@@ -473,6 +544,12 @@ def _convert(value, data_type, scale=0):
             return _dt.time.fromisoformat(_trim_fraction(value))
         if data_type == "DATE":
             return _dt.date.fromisoformat(value)
+        if data_type in ("BINARY", "VARBINARY"):
+            # The engine renders binary as hex; hand back the bytes that went in.
+            try:
+                return bytes.fromhex(value)
+            except ValueError:
+                return value
         return value
     if isinstance(value, (int, _decimal.Decimal)):
         return _convert_number(value, data_type, scale)
@@ -536,9 +613,15 @@ def _trim_fraction(text):
 # -- client-side parameter binding ------------------------------------------
 
 def _quote_ident(name):
-    if all(("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in "_$" for ch in name):
-        return name
-    return '"' + name + '"'
+    """Quote an identifier unless it is already an unambiguous uppercase one.
+
+    An embedded double quote has to be doubled: without that, a name carrying one
+    would end the quoted identifier early and the rest would be parsed as SQL.
+    """
+    text = str(name)
+    if text and all(("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in "_$" for ch in text):
+        return text
+    return '"' + text.replace('"', '""') + '"'
 
 
 def _encode_string(text):
@@ -604,6 +687,10 @@ def _substitute(sql, parameters):
             j = _skip_line(sql, i)
             out.append(sql[i:j])
             i = j
+        elif ch == "$" and sql.startswith("$$", i):
+            j = _skip_dollar_quoted(sql, i)
+            out.append(sql[i:j])
+            i = j
         elif ch == "?":
             if next_param >= len(params):
                 raise ProgrammingError("not enough parameters for placeholders")
@@ -649,3 +736,11 @@ def _skip_quoted(s, i, q):
 def _skip_line(s, i):
     j = s.find("\n", i)
     return len(s) if j < 0 else j + 1
+
+
+def _skip_dollar_quoted(s, i):
+    """Step over a $$…$$ block — a dollar-quoted string, which is how the engine's
+    procedure and UDF bodies are written. Everything inside is data, including the
+    semicolons and placeholders that would otherwise be interpreted."""
+    end = s.find("$$", i + 2)
+    return len(s) if end < 0 else end + 2
