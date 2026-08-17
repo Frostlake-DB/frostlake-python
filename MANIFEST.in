@@ -1,0 +1,3 @@
+# The tests ship in the sdist so the driver can be audited and verified from it.
+include test_frostlake.py
+include test_frostlake_unit.py

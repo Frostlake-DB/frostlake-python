@@ -1,10 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "frostlake"
-version = "0.1.0"
-description = "Pure-stdlib DB-API 2.0 driver for Frostlake over its HTTP protocol"
+description = "Pure-stdlib DB-API 2.0 (PEP 249) driver for Frostlake over its HTTP protocol"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "MLorek" }]
+keywords = ["frostlake", "snowflake", "sql", "database", "dbapi", "pep249", "driver"]
+dynamic = ["version"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Database",
+    "Topic :: Database :: Front-Ends",
+]
+
+[project.urls]
+Homepage = "https://frostlake.dev"
+Source = "https://github.com/Frostlake-DB/frostlake-python"
+Issues = "https://github.com/Frostlake-DB/frostlake-python/issues"
 
 [tool.setuptools]
 py-modules = ["frostlake"]
+
+[tool.setuptools.dynamic]
+version = { attr = "frostlake.__version__" }

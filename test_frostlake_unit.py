@@ -20,6 +20,10 @@ class ModuleSurfaceTest(unittest.TestCase):
         self.assertEqual(1, frostlake.threadsafety)
         self.assertEqual("qmark", frostlake.paramstyle)
 
+    def test_version(self):
+        # pyproject reads the package version from this attribute, so it has to stay.
+        self.assertRegex(frostlake.__version__, r"^\d+\.\d+")
+
     def test_exception_hierarchy(self):
         self.assertTrue(issubclass(frostlake.Warning, Exception))
         self.assertTrue(issubclass(frostlake.Error, Exception))
