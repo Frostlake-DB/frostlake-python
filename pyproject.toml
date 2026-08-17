@@ -1,0 +1,10 @@
+[project]
+name = "frostlake"
+version = "0.1.0"
+description = "Pure-stdlib DB-API 2.0 driver for Frostlake over its HTTP protocol"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+
+[tool.setuptools]
+py-modules = ["frostlake"]

@@ -1,0 +1,8 @@
+db-engine.log
+__pycache__/
+.idea
+
+# build artifacts
+frostlake.egg-info/
+build/
+dist/
