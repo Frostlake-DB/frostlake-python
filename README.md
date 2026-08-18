@@ -45,9 +45,10 @@ statements on the connection's session before its first statement.
   `Binary` are all present. `ROWID` matches nothing — the engine has no rowid.
 - **Multi-statement**: `execute()` exposes the first result set; `cursor.nextset()` steps
   to the next and returns `None` once the last one is current.
-- **Transactions**: connections start in autocommit (matching the Snowflake Python
-  connector, not strict DB-API); `conn.begin()` or `conn.autocommit = False` for explicit
-  transactions, then `commit()`/`rollback()`.
+- **Transactions**: connections start in autocommit rather than the strict DB-API
+  default; `conn.begin()` or `conn.autocommit = False` for explicit transactions, then
+  `commit()`/`rollback()`. With autocommit off the connection stays transactional —
+  ending one transaction opens the next.
 - `cursor.rowcount` is derived from the engine's one-cell DML result
   (`number of rows inserted` / `updated` / `deleted`). `cursor.lastrowid` is always `None`.
 - `cursor.callproc(name, params)` issues `CALL name(...)` and returns the input sequence

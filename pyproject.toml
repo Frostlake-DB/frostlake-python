@@ -10,7 +10,7 @@ requires-python = ">=3.9"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "MLorek" }]
-keywords = ["frostlake", "snowflake", "sql", "database", "dbapi", "pep249", "driver"]
+keywords = ["frostlake", "sql", "database", "dbapi", "pep249", "driver", "client"]
 dynamic = ["version"]
 classifiers = [
     "Development Status :: 4 - Beta",
