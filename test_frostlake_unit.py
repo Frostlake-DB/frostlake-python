@@ -8,6 +8,7 @@ These need no server and no JVM, so they run on a bare checkout:
 import datetime
 import decimal
 import http.server
+import json
 import threading
 import unittest
 
@@ -335,13 +336,17 @@ class DollarQuotedTest(unittest.TestCase):
 
 class QuoteIdentifierTest(unittest.TestCase):
 
-    def test_plain_uppercase_names_are_left_bare(self):
+    def test_plain_names_are_left_bare_in_any_case(self):
+        # Bare, a name folds the way SQL folds it: my_db selects MY_DB.
         self.assertEqual("MY_DB", frostlake._quote_ident("MY_DB"))
         self.assertEqual("T1$X", frostlake._quote_ident("T1$X"))
+        self.assertEqual("my_db", frostlake._quote_ident("my_db"))
+        self.assertEqual("Mixed_Case", frostlake._quote_ident("Mixed_Case"))
 
-    def test_lowercase_and_spaces_are_quoted(self):
-        self.assertEqual('"my_db"', frostlake._quote_ident("my_db"))
+    def test_names_that_cannot_be_written_bare_are_quoted(self):
         self.assertEqual('"has space"', frostlake._quote_ident("has space"))
+        self.assertEqual('"1ABC"', frostlake._quote_ident("1ABC"))
+        self.assertEqual('"my-db"', frostlake._quote_ident("my-db"))
 
     def test_embedded_quotes_are_doubled(self):
         # Without doubling, the identifier would end early and the remainder would be
@@ -495,6 +500,37 @@ class ContextManagerFailureTest(unittest.TestCase):
         self.assertTrue(conn._closed)
 
 
+class DescriptionSizeTest(unittest.TestCase):
+    """display_size/internal_size come from the wire's `length`, when it sends one."""
+
+    def cursor_for(self, columns):
+        # No connection is opened: the cursor is handed a server answer directly.
+        conn = frostlake.connect("frostlake://localhost:18082/db")
+        cur = conn.cursor()
+        cur._load({"resultSets": [{"columns": columns, "rows": []}]})
+        return cur
+
+    def test_text_and_binary_lengths_are_reported(self):
+        cur = self.cursor_for([
+            {"name": "A", "dataType": "VARCHAR", "length": 20, "nullable": True},
+            {"name": "C", "dataType": "BINARY", "length": 10, "nullable": True},
+        ])
+        self.assertEqual([20, 10], [d[3] for d in cur.description])
+        # display_size is None even where a length is known: the account's own client
+        # reports no display width, because the server sends none.
+        self.assertEqual([None, None], [d[2] for d in cur.description])
+
+    def test_a_column_without_a_length_reports_none(self):
+        # Non-text types omit the field, and so does a server predating it. PEP 249
+        # reads a missing size as None, which is not the same as 0.
+        cur = self.cursor_for([
+            {"name": "E", "dataType": "NUMBER", "precision": 12, "scale": 2, "nullable": True},
+            {"name": "F", "dataType": "DATE", "nullable": True},
+        ])
+        self.assertEqual([None, None], [d[3] for d in cur.description])
+        self.assertEqual([None, None], [d[2] for d in cur.description])
+
+
 class DsnTest(unittest.TestCase):
 
     def test_rejects_unusable_dsn(self):
@@ -507,9 +543,25 @@ class DsnTest(unittest.TestCase):
         conn = frostlake.connect("frostlake://localhost:18082/MY_DB?schema=PUBLIC")
         self.assertEqual(["USE DATABASE MY_DB", "USE SCHEMA PUBLIC"], conn._pending_use)
 
-    def test_quoted_identifiers_for_lowercase_names(self):
+    def test_lowercase_dsn_names_are_sent_bare_so_they_fold(self):
         conn = frostlake.connect("frostlake://localhost:18082/my_db")
-        self.assertEqual(['USE DATABASE "my_db"'], conn._pending_use)
+        self.assertEqual(["USE DATABASE my_db"], conn._pending_use)
+
+    def test_a_quoted_name_is_passed_through_so_it_matches_exactly(self):
+        # Quotes are how a caller asks for an object whose real name is not upper
+        # case; doubling them here would ask for a name made of quote characters.
+        conn = frostlake.connect(host="h", database='"my_db"', schema='"s"')
+        self.assertEqual(['USE DATABASE "my_db"', 'USE SCHEMA "s"'], conn._pending_use)
+        self.assertEqual('"my db"', frostlake._quote_ident('"my db"'))
+        self.assertEqual('"a""b"', frostlake._quote_ident('"a""b"'))
+
+    def test_a_name_that_only_looks_quoted_is_still_escaped(self):
+        # Anything that is not a well-formed quoted identifier is escaped, so a stray
+        # quote can never end the identifier early and let the rest through as SQL.
+        self.assertEqual('"""a"', frostlake._quote_ident('"a'))
+        self.assertEqual('"""a""b"""', frostlake._quote_ident('"a"b"'))
+        self.assertEqual('"a""; DROP DATABASE x; --"',
+                         frostlake._quote_ident('a"; DROP DATABASE x; --'))
 
 
 class ClosedStateTest(unittest.TestCase):
@@ -542,6 +594,65 @@ class ClosedStateTest(unittest.TestCase):
     def test_lastrowid_is_none(self):
         conn = frostlake.connect("frostlake://localhost:18082/db")
         self.assertIsNone(conn.cursor().lastrowid)
+
+
+class MultiStatementCountWireTest(unittest.TestCase):
+    """What `num_statements` puts on the wire, and what it leaves alone."""
+
+    BODIES = []
+
+    @classmethod
+    def setUpClass(cls):
+        bodies = cls.BODIES
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                bodies.append(json.loads(self.rfile.read(length).decode("utf-8")))
+                body = b'{"success": true, "sessionId": "s1", "resultSets": []}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                pass
+
+        cls.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        del self.BODIES[:]
+        self.conn = frostlake.connect(host="127.0.0.1",
+                                      port=self.server.server_address[1], timeout=5)
+        self.cur = self.conn.cursor()
+
+    def test_asking_for_nothing_sends_no_field(self):
+        self.cur.execute("SELECT 1")
+        self.assertNotIn("multiStatementCount", self.BODIES[-1])
+
+    def test_a_count_rides_on_the_request(self):
+        self.cur.execute("SELECT 1; SELECT 2;", num_statements=2)
+        self.assertEqual(2, self.BODIES[-1]["multiStatementCount"])
+        # The count went with the statement: nothing else was sent to move the session.
+        self.assertEqual(["SELECT 1; SELECT 2;"], [b["sql"] for b in self.BODIES])
+
+    def test_zero_is_an_answer_and_is_sent(self):
+        self.cur.execute("SELECT 1; SELECT 2;", num_statements=0)
+        self.assertEqual(0, self.BODIES[-1]["multiStatementCount"])
+
+    def test_a_bad_count_is_refused_before_anything_is_sent(self):
+        for bad in (-1, "2", 1.5, True):
+            self.assertRaises(frostlake.ProgrammingError,
+                              self.cur.execute, "SELECT 1", None, bad)
+        self.assertEqual([], self.BODIES)
 
 
 if __name__ == "__main__":

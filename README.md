@@ -27,6 +27,12 @@ for row in cur:
 `host=`/`port=`/`database=`/`schema=` keywords. The DSN's database/schema apply as `USE`
 statements on the connection's session before its first statement.
 
+Those names follow SQL's own rule: written plainly, a name folds to upper case, so
+`database="my_db"` selects `MY_DB`. To reach an object whose real name is lower- or
+mixed-case, include the double quotes — `database='"my_db"'`, or
+`frostlake://host:port/"my_db"` — and it is used exactly as written. A name that cannot
+be written bare (a space, a leading digit) is quoted for you.
+
 ## Semantics
 
 - `paramstyle = "qmark"`; parameters are inlined client-side with the same rules as
@@ -38,13 +44,26 @@ statements on the connection's session before its first statement.
   `float`; `BOOLEAN` → `bool`; `DATE`/`TIME`/`TIMESTAMP*` → `datetime.date`/`time`/
   `datetime`; semi-structured cells (`VARIANT`/`OBJECT`/`ARRAY`) as the JSON text the
   engine returns.
+- **Column sizes**: `description[i][3]` (`internal_size`) is the column's length —
+  characters for a text column, bytes for a binary one — when the server sends one, and
+  `None` for every other type and for engines predating the field. `display_size` stays
+  `None` throughout, as it does in the account's own Python client: the server sends no
+  display width, so there is none to report.
 - **Type objects and constructors**: the PEP 249 singletons `STRING`, `BINARY`, `NUMBER`,
   `DATETIME`, `ROWID` compare equal to the engine type names in their family, so
   `cur.description[i][1] == frostlake.NUMBER` works (parameterized spellings like
   `NUMBER(38,10)` included). `Date`, `Time`, `Timestamp`, the `*FromTicks` variants and
   `Binary` are all present. `ROWID` matches nothing — the engine has no rowid.
-- **Multi-statement**: `execute()` exposes the first result set; `cursor.nextset()` steps
-  to the next and returns `None` once the last one is current.
+- **Multi-statement**, once the call or the session asks for it: as on the account, a request
+  carries one statement unless something says otherwise, and a pack sent without asking is
+  refused. `cursor.execute(sql, num_statements=n)` declares how many statements that one call
+  carries — `0` for any number — the way the account's own connector spells it: the count
+  travels with that request, outranks the session's `MULTI_STATEMENT_COUNT` for it, and moves
+  no session state, so there is nothing to put back and other cursors on the connection are
+  unaffected. `ALTER SESSION SET MULTI_STATEMENT_COUNT = n` still sets it for the session;
+  left out, nothing is sent and the session's value decides, which is 1 until it is told
+  otherwise. `execute()` exposes the first result set; `cursor.nextset()` steps to the next
+  and returns `None` once the last one is current.
 - **Transactions**: connections start in autocommit rather than the strict DB-API
   default; `conn.begin()` or `conn.autocommit = False` for explicit transactions, then
   `commit()`/`rollback()`. With autocommit off the connection stays transactional —

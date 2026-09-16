@@ -294,6 +294,20 @@ class FrostlakeDriverTest(unittest.TestCase):
         self.assertEqual(['USE DATABASE "we""ird"'], conn._pending_use)
         conn.close()
 
+    def test_a_quoted_name_reaches_a_lower_case_database(self):
+        # USE resolves names exactly: a database created quoted keeps its lower case,
+        # and only a quoted name finds it again — a bare one would fold to upper case.
+        cur = self.conn.cursor()
+        cur.execute('CREATE OR REPLACE DATABASE "py_quoted_db"')
+        conn = frostlake.connect(DSN, database='"py_quoted_db"')
+        self.assertEqual(['USE DATABASE "py_quoted_db"'], conn._pending_use)
+        scoped = conn.cursor()
+        scoped.execute("SELECT CURRENT_DATABASE()")
+        # 0.1.0 keeps the quoted name's case; 0.0.7 upper-cased it on the way in and
+        # looked names up case-insensitively, so either answer means the USE landed.
+        self.assertIn(scoped.fetchall(), ([("py_quoted_db",)], [("PY_QUOTED_DB",)]))
+        conn.close()
+
     def test_explicit_commit_persists(self):
         cur = self.conn.cursor()
         cur.execute("CREATE OR REPLACE DATABASE py_commit_db")
@@ -397,17 +411,60 @@ class FrostlakeDriverTest(unittest.TestCase):
 
     def test_multiple_result_sets(self):
         cur = self.conn.cursor()
+        # A pack has to be asked for: a session takes one statement per request until it says otherwise.
+        cur.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 0")
         cur.execute("SELECT 1 AS a; SELECT 2 AS b; SELECT 3 AS c;")
         collected = [cur.fetchall()]
         while cur.nextset():
             collected.append(cur.fetchall())
         self.assertEqual([[(1,)], [(2,)], [(3,)]], collected)
         self.assertIsNone(cur.nextset())
+        # This connection is shared with the other tests, so put the gate back where it was.
+        cur.execute("ALTER SESSION SET MULTI_STATEMENT_COUNT = 1")
 
     def test_nextset_returns_none_for_a_single_statement(self):
         cur = self.conn.cursor()
         cur.execute("SELECT 1 AS a")
         self.assertIsNone(cur.nextset())
+
+    def test_semi_structured_values_come_back_as_their_json_text(self):
+        # A VARIANT/OBJECT/ARRAY cell reaches a client as the JSON text of the value,
+        # which is what the account's own driver hands back, so the driver passes it
+        # through untouched rather than parsing it into Python objects.
+        cur = self.conn.cursor()
+        cur.execute("CREATE OR REPLACE DATABASE py_variant_db")
+        cur.execute("USE DATABASE py_variant_db")
+        cur.execute("CREATE TABLE v (j VARIANT, o OBJECT, a ARRAY)")
+        cur.execute("""INSERT INTO v SELECT PARSE_JSON('{"a":1}'),
+                       OBJECT_CONSTRUCT('b', 2), ARRAY_CONSTRUCT(1, 2)""")
+        cur.execute("SELECT j, o, a FROM v")
+        self.assertEqual(["VARIANT", "OBJECT", "ARRAY"], [d[1] for d in cur.description])
+        row = cur.fetchone()
+        self.assertEqual(('{"a":1}', '{"b":2}', "[1,2]"), row)
+        for value in row:
+            self.assertIsInstance(value, str)
+
+    def test_a_semi_structured_expression_keeps_its_json_text(self):
+        # The same for a value that never reaches a table, including a scalar VARIANT,
+        # which arrives as the text "7" rather than the number.
+        cur = self.conn.cursor()
+        cur.execute("""SELECT PARSE_JSON('{"a":1}') AS p, TO_VARIANT(7) AS n""")
+        self.assertEqual([('{"a":1}', "7")], cur.fetchall())
+
+    def test_description_reports_text_and_binary_lengths(self):
+        cur = self.conn.cursor()
+        cur.execute("CREATE OR REPLACE DATABASE py_len_db")
+        cur.execute("USE DATABASE py_len_db")
+        cur.execute("CREATE TABLE s (t VARCHAR(20), b BINARY(10), n NUMBER(12,2))")
+        cur.execute("SELECT t, b, n FROM s")
+        sizes = [(d[2], d[3]) for d in cur.description]
+        if sizes[0][1] is None:
+            # An engine predating the wire's length field sends none at all.
+            self.assertEqual([(None, None)] * 3, sizes)
+        else:
+            # Characters for text, bytes for binary; a number carries no length. The
+            # display size stays None throughout, as the account's own client reports it.
+            self.assertEqual([(None, 20), (None, 10), (None, None)], sizes)
 
     def test_description_reports_nullability(self):
         cur = self.conn.cursor()
@@ -509,6 +566,53 @@ class FrostlakeDriverTest(unittest.TestCase):
         cur.execute("SELECT 1")
         conn.close()
         self.assertRaises(frostlake.InterfaceError, cur.execute, "SELECT 1")
+
+
+class MultiStatementCountTest(unittest.TestCase):
+    """`num_statements` declares one call's pack; the session's own count stays where it was."""
+
+    def setUp(self):
+        self.conn = frostlake.connect(DSN)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_a_declared_pack_runs_and_every_set_is_readable(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 AS a; SELECT 2 AS b;", num_statements=2)
+        self.assertEqual([(1,)], cur.fetchall())
+        self.assertTrue(cur.nextset())
+        self.assertEqual([(2,)], cur.fetchall())
+        self.assertIsNone(cur.nextset())
+
+    def test_zero_takes_any_number(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 AS a; SELECT 2 AS b; SELECT 3 AS c;", num_statements=0)
+        self.assertEqual([(1,)], cur.fetchall())
+        self.assertTrue(cur.nextset())
+        self.assertTrue(cur.nextset())
+        self.assertEqual([(3,)], cur.fetchall())
+
+    def test_the_session_count_is_untouched(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 AS a; SELECT 2 AS b;", num_statements=2)
+        # No ALTER SESSION was sent, so the same connection still refuses an undeclared
+        # pack: the count rode on that one request and moved nothing.
+        enforced = True
+        try:
+            cur.execute("SELECT 1 AS a; SELECT 2 AS b;")
+        except frostlake.ProgrammingError:
+            pass
+        else:
+            enforced = False
+        # Either way the connection is still usable for an ordinary statement.
+        cur.execute("SELECT 9 AS a")
+        self.assertEqual([(9,)], cur.fetchall())
+        if not enforced:
+            # An engine predating the statement-count rule accepts any pack, so it has
+            # nothing to refuse here. Skip rather than pass: the refusal is the point,
+            # and a green tick would claim this engine was checked for it.
+            self.skipTest("this engine does not enforce the statement count")
 
 
 if __name__ == "__main__":

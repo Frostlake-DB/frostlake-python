@@ -30,7 +30,7 @@ import urllib.error as _urlerror
 import urllib.parse as _urlparse
 import urllib.request as _urlrequest
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 apilevel = "2.0"
 threadsafety = 1
@@ -281,19 +281,22 @@ class Connection(object):
         while self._pending_use:
             self._execute_raw(self._pending_use.pop(0))
 
-    def _execute(self, sql):
+    def _execute(self, sql, num_statements=None):
         self._check_open()
         self._drain_pending_use()
         if self._begin_pending:
             self._begin_pending = False
             self._execute_raw("BEGIN")
             self._in_transaction = True
-        return self._execute_raw(sql)
+        return self._execute_raw(sql, num_statements)
 
-    def _execute_raw(self, sql):
+    def _execute_raw(self, sql, num_statements=None):
         payload = {"sql": sql, "autoCommit": self.autocommit}
         if self._session_id:
             payload["sessionId"] = self._session_id
+        if num_statements is not None:
+            # Checked before anything is sent, so a bad value never reaches the server.
+            payload["multiStatementCount"] = _statement_count(num_statements)
         req = _urlrequest.Request(
             self._base_url + "/api/execute",
             data=_json.dumps(payload).encode("utf-8"),
@@ -337,10 +340,18 @@ class Cursor(object):
 
     # -- PEP 249 surface ----------------------------------------------------
 
-    def execute(self, operation, parameters=None):
+    def execute(self, operation, parameters=None, num_statements=None):
+        """Run one statement, or a pack of them.
+
+        `num_statements` says how many statements this one call carries, `0` for any
+        number, and is sent with the request: it outranks the session's
+        MULTI_STATEMENT_COUNT for this call only and changes no session state. Left out,
+        nothing is sent and the session's value decides, which is 1 until it is told
+        otherwise.
+        """
         self._check_open()
         sql = _substitute(operation, parameters) if parameters else operation
-        out = self.connection._execute(sql)
+        out = self.connection._execute(sql, num_statements)
         self._load(out)
         return self
 
@@ -448,8 +459,17 @@ class Cursor(object):
             return
         rs = self._result_sets[self._set_index] or {}
         columns = rs.get("columns") or []
+        # internal_size carries the wire's `length`: characters for a text column, bytes
+        # for a binary one. Every other type omits the field, as do servers predating it,
+        # and PEP 249 reads a missing size as None — so an absent length stays None
+        # rather than becoming 0 or an invented maximum.
+        #
+        # display_size stays None even when the length is known, which is what the
+        # account's own Python client does (its ResultMetadata passes None for that slot).
+        # The server sends no display width, and deriving one from the length would be a
+        # guess dressed up as metadata.
         self.description = [
-            (c.get("name"), c.get("dataType"), None, None,
+            (c.get("name"), c.get("dataType"), None, c.get("length"),
              c.get("precision"), c.get("scale"), c.get("nullable"))
             for c in columns
         ]
@@ -510,6 +530,21 @@ def _dml_rowcount(columns, row):
 # Types the engine stores as binary floating point; every other numeric is fixed-point.
 _APPROXIMATE_TYPES = frozenset(("FLOAT", "FLOAT4", "FLOAT8", "DOUBLE",
                                 "DOUBLE PRECISION", "REAL"))
+
+
+def _statement_count(value):
+    """The per-call statement count a caller asked for, checked before it is sent.
+
+    How many statements the call carries, `0` meaning any number. It rides on the request
+    and leaves the session's MULTI_STATEMENT_COUNT alone, so there is nothing to save and
+    put back, and a connection shared between cursors is unaffected.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProgrammingError(
+            "num_statements must be an int, not " + type(value).__name__)
+    if value < 0:
+        raise ProgrammingError("num_statements must be 0 or more, not %d" % value)
+    return value
 
 
 def _load_json(text):
@@ -612,14 +647,30 @@ def _trim_fraction(text):
 
 # -- client-side parameter binding ------------------------------------------
 
+_PLAIN_IDENT = _re.compile(r"[A-Za-z_][A-Za-z0-9_$]*\Z")
+_QUOTED_IDENT = _re.compile(r'"(?:[^"]|"")*"\Z')
+
+
 def _quote_ident(name):
-    """Quote an identifier unless it is already an unambiguous uppercase one.
+    """Render a DSN's database or schema name for a USE statement.
+
+    A plain name is sent bare, so it folds to upper case exactly as it does in SQL:
+    ``my_db`` selects MY_DB. Quoted as given it would ask for an object named
+    ``my_db`` in lower case, which USE refuses — it resolves names exactly, as live
+    does.
+
+    A name already written in double quotes is passed through untouched, which is how
+    a caller reaches an object whose real name is not upper case:
+    ``database='"my_db"'`` selects the lower-case my_db. Anything else (a space, a
+    leading digit, a stray quote) is quoted as given.
 
     An embedded double quote has to be doubled: without that, a name carrying one
-    would end the quoted identifier early and the rest would be parsed as SQL.
+    would end the quoted identifier early and the rest would be parsed as SQL. Only a
+    well-formed quoted name — every interior quote already doubled — is passed
+    through, so a half-quoted one cannot smuggle SQL past this.
     """
     text = str(name)
-    if text and all(("A" <= ch <= "Z") or ("0" <= ch <= "9") or ch in "_$" for ch in text):
+    if _PLAIN_IDENT.match(text) or _QUOTED_IDENT.match(text):
         return text
     return '"' + text.replace('"', '""') + '"'
 
