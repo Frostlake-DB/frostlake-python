@@ -19,6 +19,11 @@ cursor.nextset().
 The connection starts in autocommit mode rather than the strict DB-API default; set
 conn.autocommit = False (or call conn.begin()) for explicit transactions. With it off
 the connection stays transactional: ending one transaction opens the next.
+
+Each connection holds one engine session, and close() releases it. When the engine has
+lost the session (idle expiry, release, restart), the driver starts a fresh one on the
+connection's scope and sends the statement once more, unless the lost session held a
+transaction or context a fresh one would lack; then SessionLostError says so instead.
 """
 
 import datetime as _dt
@@ -75,6 +80,18 @@ class DataError(DatabaseError):
 
 class NotSupportedError(DatabaseError):
     pass
+
+
+class SessionLostError(OperationalError):
+    """The engine no longer holds the connection's session and the statement did not run.
+
+    The session expired, was released, or went with a server restart, and it held something
+    a fresh session would not have: an open transaction, or context set up with USE, SET,
+    ALTER SESSION or a temporary object. Running the statement in a fresh session would put
+    it somewhere its author did not intend, so it is refused instead. Also raised when the
+    engine refuses the fresh session that was to replace a lost one. The connection stays
+    usable: its next statement starts a fresh session on the connection's scope.
+    """
 
 
 # -- type objects (PEP 249) --------------------------------------------------
@@ -188,6 +205,7 @@ class Connection(object):
     InternalError = InternalError
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
+    SessionLostError = SessionLostError
 
     def __init__(self, base_url, database, schema, timeout):
         self._base_url = base_url
@@ -206,6 +224,16 @@ class Connection(object):
             self._pending_use.append("USE DATABASE " + _quote_ident(database))
         if schema:
             self._pending_use.append("USE SCHEMA " + _quote_ident(schema))
+        # The connection's scope: the statements that put a fresh session where the
+        # connection asked to be. _pending_use holds the part not yet on the session;
+        # all of it goes back on a session that replaces a lost one.
+        self._scope = list(self._pending_use)
+        # Whether the engine reports `newSession`, which arrived together with
+        # requireSession and DELETE /api/sessions. None until the first answer that
+        # names a session.
+        self._tracks_sessions = None
+        # Set once a statement left state behind that a fresh session would not have.
+        self._dirty = False
 
     # -- PEP 249 surface ----------------------------------------------------
 
@@ -220,8 +248,10 @@ class Connection(object):
             return
         self._autocommit = wanted
         if wanted:
-            self._end_transaction("COMMIT")
+            # No BEGIN is owed with autocommit on, whatever the COMMIT meets: one left
+            # armed would open a transaction that nobody commits.
             self._begin_pending = False
+            self._end_transaction("COMMIT")
         else:
             self._begin_pending = True
 
@@ -231,45 +261,116 @@ class Connection(object):
 
     def commit(self):
         self._check_open()
-        self._end_transaction("COMMIT")
-        self._begin_pending = not self._autocommit
+        try:
+            self._end_transaction("COMMIT")
+        finally:
+            self._arm_next_transaction()
 
     def rollback(self):
         self._check_open()
-        self._end_transaction("ROLLBACK")
-        self._begin_pending = not self._autocommit
+        try:
+            self._end_transaction("ROLLBACK")
+        finally:
+            self._arm_next_transaction()
+
+    def _arm_next_transaction(self):
+        """With autocommit off the connection stays transactional: once no transaction is
+        open, however the last one ended, the next statement opens a fresh one. One still
+        open (a COMMIT whose fate is unknown) is joined instead."""
+        self._begin_pending = not self._autocommit and not self._in_transaction
 
     def begin(self):
-        """Start an explicit transaction (disables autocommit for this connection)."""
+        """Start an explicit transaction (disables autocommit for this connection).
+
+        BEGIN itself goes out with autocommit off, and the connection turns autocommit off
+        only once BEGIN took: a begin() that raises leaves the connection as it was, so
+        the next statement does not run in a transaction nobody opened.
+        """
         self._check_open()
         # Send the DSN's USE statements first. Run inside the transaction they would
         # implicitly commit it, quietly losing everything that followed.
         self._drain_pending_use()
+        self._execute_raw("BEGIN", autocommit=False)
         self._autocommit = False
         self._begin_pending = False
-        self._execute_raw("BEGIN")
         self._in_transaction = True
 
     def _end_transaction(self, statement):
-        if self._in_transaction:
-            self._in_transaction = False
+        """Send COMMIT or ROLLBACK for the open transaction, when one is open.
+
+        The transaction stays marked open while the statement travels: a COMMIT that finds
+        the session gone must say the transaction went with it, not run on a fresh one.
+        Afterwards it is ended, except after a COMMIT whose answer never came (a transport
+        failure, a timeout, an unreadable answer): its fate is unknown, so the transaction
+        stays open, the next statement joins it, and the next commit() sends COMMIT again.
+        A COMMIT the engine refused leaves a transaction nobody chose, so it is rolled back,
+        best effort, before the refusal is raised.
+        """
+        if not self._in_transaction:
+            return
+        if statement != "COMMIT":
+            try:
+                self._execute_raw(statement)
+            finally:
+                self._in_transaction = False
+            return
+        try:
             self._execute_raw(statement)
+        except SessionLostError:
+            raise  # the transaction went with its session, and _recover said so
+        except ProgrammingError:
+            try:
+                self._execute_raw("ROLLBACK")
+            except Exception:
+                pass
+            self._in_transaction = False
+            raise
+        self._in_transaction = False
 
     def close(self):
+        """Close the connection and release its engine session.
+
+        The release is DELETE /api/sessions/{id}, which also rolls back a transaction the
+        session left open. An engine that predates the endpoint gets a ROLLBACK for an
+        open transaction instead, and keeps the session until its own idle expiry. Either
+        is one best-effort request, bounded by the shorter of the connection's timeout and
+        five seconds: closing never raises, and closing again sends nothing.
+        """
+        if self._closed:
+            return
         self._closed = True
+        session_id = self._session_id
+        in_transaction = self._in_transaction
+        self._session_id = None
+        self._in_transaction = False
+        if session_id is None:
+            return
+        budget = _CLOSE_BUDGET
+        if self._timeout and self._timeout < budget:
+            budget = self._timeout
+        if self._tracks_sessions:
+            self._courtesy("DELETE", "/api/sessions/" + _urlparse.quote(session_id, safe=""),
+                           None, budget)
+        elif in_transaction:
+            self._courtesy("POST", "/api/execute",
+                           {"sql": "ROLLBACK", "autoCommit": self._autocommit,
+                            "sessionId": session_id},
+                           budget)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self.commit()
-        else:
-            try:
-                self.rollback()
-            except Error:
-                pass
-        self.close()
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                try:
+                    self.rollback()
+                except Error:
+                    pass
+        finally:
+            self.close()
 
     # -- protocol -----------------------------------------------------------
 
@@ -277,23 +378,85 @@ class Connection(object):
         if self._closed:
             raise InterfaceError("connection is closed")
 
+    def _use_scope(self, statements):
+        """Make `statements` the connection's scope, in place of the DSN's USE DATABASE /
+        USE SCHEMA: for a client built on this driver that sets up more (a role, a
+        warehouse, session parameters). Called before the first statement; the
+        statements are applied lazily like the DSN's, and go back on a session that
+        replaces a lost one."""
+        self._scope = list(statements)
+        self._pending_use = list(statements)
+
     def _drain_pending_use(self):
+        """Put the connection's scope on its session, starting one when there is none.
+
+        The statements run one at a time, and each is spent only once the engine accepts
+        it. A refused one stays first in line, so every later statement is refused with it
+        until the scope applies, rather than running in the server's default database. A
+        session found gone before the scope is on it held nothing yet, so the scope starts
+        over on a fresh session — once: an engine that refuses a session it has just
+        started is reported instead.
+        """
+        restarted = False
         while self._pending_use:
-            self._execute_raw(self._pending_use.pop(0))
+            pending = self._pending_use
+            statement = pending[0]
+            out = self._post(statement)
+            if out is None:
+                if restarted:
+                    raise SessionLostError("the engine refused a session it had just started")
+                restarted = True
+                self._session_id = None
+                self._pending_use = list(self._scope)
+                continue
+            if not out.get("success"):
+                error = ProgrammingError(out.get("errorMessage") or "statement failed")
+                # The caller's own statement never ran; this names the one that failed.
+                error.statement = statement
+                raise error
+            # An answer that says the engine replaced the session put the whole scope back
+            # in line (_absorb), and that line starts over from its first statement.
+            if self._pending_use is pending:
+                pending.pop(0)
 
     def _execute(self, sql, num_statements=None):
         self._check_open()
         self._drain_pending_use()
         if self._begin_pending:
+            # Spent only once BEGIN took: one that failed goes out again ahead of the next
+            # statement, which never runs outside the transaction autocommit off promises.
+            self._execute_raw("BEGIN", autocommit=False)
             self._begin_pending = False
-            self._execute_raw("BEGIN")
             self._in_transaction = True
         return self._execute_raw(sql, num_statements)
 
-    def _execute_raw(self, sql, num_statements=None):
-        payload = {"sql": sql, "autoCommit": self.autocommit}
-        if self._session_id:
+    def _execute_raw(self, sql, num_statements=None, autocommit=None):
+        """Run one statement, recovering a lost session. `autocommit` is this request's
+        own autoCommit, in place of the connection's."""
+        out = self._post(sql, num_statements, autocommit)
+        if out is None:
+            out = self._recover(sql, num_statements, autocommit)
+        if not out.get("success"):
+            raise ProgrammingError(out.get("errorMessage") or "statement failed")
+        self._track(sql)
+        return out
+
+    def _post(self, sql, num_statements=None, autocommit=None):
+        """One POST /api/execute, without any recovery: the engine's answer, or None when
+        it refused the session id as unknown (requireSession) — then nothing ran."""
+        payload = {"sql": sql,
+                   "autoCommit": self._autocommit if autocommit is None else autocommit}
+        sent_id = bool(self._session_id)
+        required = False
+        if sent_id:
             payload["sessionId"] = self._session_id
+            if self._tracks_sessions:
+                # Resume this session or refuse: without the flag the engine starts a
+                # fresh session under the same id when the old one is gone, and the
+                # statement runs without the context the connection set up. Sent only to
+                # an engine that has shown it knows the field.
+                payload["requireSession"] = True
+                required = True
         if num_statements is not None:
             # Checked before anything is sent, so a bad value never reaches the server.
             payload["multiStatementCount"] = _statement_count(num_statements)
@@ -303,23 +466,107 @@ class Connection(object):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        status = 200
         try:
             with _urlrequest.urlopen(req, timeout=self._timeout) as resp:
                 out = _load_json(resp.read().decode("utf-8"))
         except _urlerror.HTTPError as e:
             # The server answers failed statements with a non-2xx status AND the
             # error payload in the body — read it instead of surfacing the status.
+            status = e.code
             try:
                 out = _load_json(e.read().decode("utf-8"))
             except Exception:
                 raise OperationalError(str(e)) from e
         except OSError as e:
             raise OperationalError(str(e)) from e
-        if out.get("sessionId"):
-            self._session_id = out["sessionId"]
-        if not out.get("success"):
-            raise ProgrammingError(out.get("errorMessage") or "statement failed")
+        if required and status == 404 and not out.get("success") and not out.get("sessionId"):
+            return None
+        self._absorb(out, sent_id)
         return out
+
+    def _absorb(self, out, sent_id):
+        """Take the session an answer names, and what it says about the engine."""
+        session_id = out.get("sessionId")
+        if not session_id:
+            return
+        self._session_id = session_id
+        started = out.get("newSession")
+        if isinstance(started, bool):
+            self._tracks_sessions = True
+            if started and sent_id:
+                # The engine ran the statement in a fresh session in place of ours:
+                # whatever the old one held is gone, and the scope goes back on before
+                # the next statement.
+                self._forget_session()
+        elif self._tracks_sessions is None:
+            self._tracks_sessions = False
+
+    def _forget_session(self):
+        """What the session held is gone; the next statement starts on the scope."""
+        self._in_transaction = False
+        self._dirty = False
+        self._pending_use = list(self._scope)
+
+    def _recover(self, sql, num_statements, autocommit=None):
+        """The engine no longer knows the session (it expired, was released, or the server
+        restarted), and nothing ran. With a transaction or a moved context gone with it,
+        re-running would put the statement somewhere its author did not intend, so that
+        is refused; otherwise a fresh session on the connection's scope takes over and the
+        statement is sent once more."""
+        had_transaction = self._in_transaction
+        had_context = self._dirty
+        self._session_id = None
+        self._forget_session()
+        if had_transaction or had_context:
+            # With autocommit off the connection stays transactional, so the fresh
+            # session the next statement starts opens a transaction first.
+            self._begin_pending = not self._autocommit
+        if had_transaction:
+            raise SessionLostError(
+                "the engine no longer holds this connection's session (it expired, was "
+                "released, or the server restarted), so its open transaction is gone; the "
+                "statement did not run")
+        if had_context:
+            raise SessionLostError(
+                "the engine no longer holds this connection's session (it expired, was "
+                "released, or the server restarted), and the context set up on it (USE, "
+                "SET, ALTER SESSION or a temporary object) went with it, so the statement "
+                "was not re-run; the next statement starts a fresh session on the "
+                "connection's scope")
+        self._drain_pending_use()
+        out = self._post(sql, num_statements, autocommit)
+        if out is None:
+            raise SessionLostError("the engine refused a session it had just started")
+        return out
+
+    def _track(self, sql):
+        """Follow what a statement that ran did to the session: whether it left state a
+        fresh session would not have, and whether it opened or ended a transaction."""
+        for statement in _split_statements(sql):
+            if _touches_session(statement):
+                self._dirty = True
+            effect = _transaction_effect(statement)
+            if effect == _TRANSACTION_BEGINS:
+                self._in_transaction = True
+            elif effect == _TRANSACTION_ENDS:
+                self._in_transaction = False
+
+    def _courtesy(self, method, path, payload, timeout):
+        """One best-effort request on the way out; its answer and any failure are
+        ignored."""
+        data = None
+        headers = {}
+        if payload is not None:
+            data = _json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = _urlrequest.Request(self._base_url + path, data=data, headers=headers,
+                                  method=method)
+        try:
+            with _urlrequest.urlopen(req, timeout=timeout) as resp:
+                resp.read()
+        except Exception:
+            pass
 
 
 class Cursor(object):
@@ -795,3 +1042,134 @@ def _skip_dollar_quoted(s, i):
     semicolons and placeholders that would otherwise be interpreted."""
     end = s.find("$$", i + 2)
     return len(s) if end < 0 else end + 2
+
+
+# -- session tracking ---------------------------------------------------------
+
+# How long close() may spend releasing the session, at most.
+_CLOSE_BUDGET = 5.0
+
+_TRANSACTION_BEGINS = "begins"
+_TRANSACTION_ENDS = "ends"
+
+# The words that may sit between CREATE/DROP/ALTER and the kind of object being named.
+_OBJECT_MODIFIERS = frozenset((
+    "OR", "REPLACE", "TRANSIENT", "TEMPORARY", "TEMP", "VOLATILE", "LOCAL", "GLOBAL",
+    "SECURE", "IF", "NOT", "EXISTS", "PUBLIC", "PRIVATE", "ICEBERG", "DYNAMIC", "HYBRID",
+    "EVENT", "RECURSIVE", "MATERIALIZED", "EXTERNAL",
+))
+_TEMPORARY_MODIFIERS = frozenset(("TEMPORARY", "TEMP", "VOLATILE"))
+
+
+def _skip_non_code(sql, i):
+    """Index just past the literal, quoted identifier, $$ body or comment starting at
+    `i`, or -1 when `i` is code: the constructs _substitute steps over."""
+    ch = sql[i]
+    if ch == "'":
+        return _skip_string(sql, i)
+    if ch == '"':
+        return _skip_quoted(sql, i, '"')
+    if sql.startswith("--", i) or sql.startswith("//", i):
+        return _skip_line(sql, i)
+    if sql.startswith("/*", i):
+        end = sql.find("*/", i + 2)
+        return len(sql) if end < 0 else end + 2
+    if sql.startswith("$$", i):
+        return _skip_dollar_quoted(sql, i)
+    return -1
+
+
+def _split_statements(sql):
+    """The request split on its top-level semicolons; one inside a literal, a quoted
+    identifier, a $$ body or a comment does not split. Blank pieces are dropped.
+
+    A scripting block is split along with everything else, which only makes the session
+    checks more willing to flag a request — the safe direction to be wrong in.
+    """
+    pieces = []
+    start = 0
+    i = 0
+    n = len(sql)
+    while i < n:
+        past = _skip_non_code(sql, i)
+        if past >= 0:
+            i = past
+        elif sql[i] == ";":
+            pieces.append(sql[start:i])
+            i += 1
+            start = i
+        else:
+            i += 1
+    pieces.append(sql[start:])
+    return [piece for piece in pieces if piece.strip()]
+
+
+def _is_word_char(ch):
+    return ch == "_" or ch == "$" or ch.isalnum()
+
+
+def _leading_words(statement, limit):
+    """Up to `limit` leading words of a statement, upper-cased, skipping whitespace and
+    comments and stopping at the first thing that is not a word."""
+    words = []
+    i = 0
+    n = len(statement)
+    while len(words) < limit and i < n:
+        ch = statement[i]
+        if ch.isspace():
+            i += 1
+        elif statement.startswith("--", i) or statement.startswith("//", i):
+            i = _skip_line(statement, i)
+        elif statement.startswith("/*", i):
+            end = statement.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        elif _is_word_char(ch):
+            start = i
+            while i < n and _is_word_char(statement[i]):
+                i += 1
+            words.append(statement[start:i].upper())
+        else:
+            break
+    return words
+
+
+def _touches_session(statement):
+    """Whether a statement leaves behind state a fresh session would not have: a moved
+    scope (USE, CREATE or DROP of a DATABASE or SCHEMA), a session variable or setting
+    (SET, UNSET, ALTER SESSION), or a temporary object. CREATE TABLE and its kind leave
+    the session as it was."""
+    words = _leading_words(statement, 16)
+    if not words:
+        return False
+    verb, rest = words[0], words[1:]
+    if verb in ("USE", "SET", "UNSET"):
+        return True
+    if verb not in ("ALTER", "CREATE", "DROP"):
+        return False
+    kind = 0
+    while kind < len(rest) and rest[kind] in _OBJECT_MODIFIERS:
+        kind += 1
+    named = rest[kind] if kind < len(rest) else None
+    if verb == "ALTER":
+        return named == "SESSION"
+    if named in ("DATABASE", "SCHEMA"):
+        return True
+    if verb == "CREATE":
+        for word in rest[:kind]:
+            if word in _TEMPORARY_MODIFIERS:
+                return True
+    return False
+
+
+def _transaction_effect(statement):
+    """Whether a statement opens or ends a transaction. BEGIN on its own (or with
+    TRANSACTION, WORK or NAME) opens one; BEGIN followed by a statement opens a scripting
+    block instead."""
+    words = _leading_words(statement, 2)
+    if words == ["BEGIN"] or words == ["START", "TRANSACTION"]:
+        return _TRANSACTION_BEGINS
+    if len(words) == 2 and words[0] == "BEGIN" and words[1] in ("TRANSACTION", "WORK", "NAME"):
+        return _TRANSACTION_BEGINS
+    if words and words[0] in ("COMMIT", "ROLLBACK"):
+        return _TRANSACTION_ENDS
+    return None

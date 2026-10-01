@@ -5,7 +5,7 @@ the engine's HTTP protocol against a running `DatabaseHttpServer`. No JVM, no de
 
 ## Engine version
 
-Requires a Frostlake engine **0.0.7 or newer**. Ask a running server which one it is with
+Requires a Frostlake engine **0.2.0 or newer**. Ask a running server which one it is with
 `SELECT CURRENT_VERSION()` — every release answers it, so the check works against any engine.
 
 The driver versions independently of the engine: it speaks the HTTP protocol, not
@@ -25,7 +25,11 @@ for row in cur:
 
 `connect()` accepts a DSN (`frostlake://host:port[/DATABASE][?schema=SCHEMA]`) or
 `host=`/`port=`/`database=`/`schema=` keywords. The DSN's database/schema apply as `USE`
-statements on the connection's session before its first statement.
+statements on the connection's session before its first statement. A `USE` the engine
+refuses (a database or schema that does not exist, or one the role cannot use) stays
+first in line: every statement fails with that refusal, whose `statement` attribute names
+the refused `USE`, until the engine accepts it. Nothing runs in the server's default
+database in its place.
 
 Those names follow SQL's own rule: written plainly, a name folds to upper case, so
 `database="my_db"` selects `MY_DB`. To reach an object whose real name is lower- or
@@ -67,7 +71,18 @@ be written bare (a space, a leading digit) is quoted for you.
 - **Transactions**: connections start in autocommit rather than the strict DB-API
   default; `conn.begin()` or `conn.autocommit = False` for explicit transactions, then
   `commit()`/`rollback()`. With autocommit off the connection stays transactional —
-  ending one transaction opens the next.
+  ending one transaction opens the next. A transaction opened with a `BEGIN` statement
+  counts too: `commit()`/`rollback()` end it. `begin()` turns autocommit off only once its
+  `BEGIN` took, so a `begin()` that raises leaves the connection as it was, and the next
+  statement commits on its own. With autocommit off, a `BEGIN` that failed goes out again
+  ahead of the next statement, so no statement runs outside a transaction. Turning
+  autocommit back on leaves no `BEGIN` owed, even when the `COMMIT` it sends fails. A
+  `COMMIT` the engine refuses is followed by a `ROLLBACK`, which ends the transaction before
+  the refusal is raised. A `COMMIT` whose answer never came (a dropped connection, a
+  timeout, an unreadable answer) leaves the transaction open: the next statement joins it,
+  and the next `commit()` sends `COMMIT` again. A `ROLLBACK` ends the transaction whatever
+  it meets. After any of these, with autocommit off, the next statement runs in a
+  transaction: the open one, or a fresh one.
 - `cursor.rowcount` is derived from the engine's one-cell DML result
   (`number of rows inserted` / `updated` / `deleted`). `cursor.lastrowid` is always `None`.
 - `cursor.callproc(name, params)` issues `CALL name(...)` and returns the input sequence
@@ -75,7 +90,40 @@ be written bare (a space, a leading digit) is quoted for you.
 - Using a closed cursor or connection raises `InterfaceError`; fetching before any
   `execute()` raises `ProgrammingError`.
 - The exception classes are also reachable as connection attributes (`conn.Error`, …).
-- One HTTP session per connection.
+- One engine session per connection; see below.
+
+## Session lifetime
+
+A connection holds one engine session, which carries its current database and schema,
+session variables, `ALTER SESSION` settings and an open transaction. The engine names the
+session in its first answer, and every later request names it again.
+
+- **What is sent.** Once the engine has shown that it tracks sessions (its answers carry
+  `newSession`, as engines from 0.1.0 do), every request that names the session also sends
+  `requireSession: true`: resume this session, or refuse. An engine whose answers lack the
+  field is never sent it.
+- **After a lost session.** The engine forgets a session that sat idle for 30 minutes, was
+  released, or went with a restart, and it refuses a request that requires it (HTTP 404)
+  without running anything. The driver drops the session and then:
+  - when the session held nothing a fresh one would lack, it starts a fresh session on the
+    connection's scope (the DSN's `USE DATABASE` / `USE SCHEMA`) and sends the statement
+    once more. A second refusal raises;
+  - when the session held an open transaction, or context set up with `USE`, `SET` /
+    `UNSET`, `ALTER SESSION`, a temporary object, or a `CREATE` / `DROP` of a database or
+    schema, it raises `frostlake.SessionLostError` (an `OperationalError`, also
+    `conn.SessionLostError`) instead. The statement did not run: in a fresh session it
+    would run somewhere its author did not intend. The connection stays usable. The next
+    statement starts a fresh session on the connection's scope, and with autocommit off it
+    opens a transaction there first.
+
+  The driver reads what a statement did from its text: `BEGIN` / `START TRANSACTION` and
+  `COMMIT` / `ROLLBACK` for the transaction, and the statements above for context.
+- **Close.** `close()` releases the session with `DELETE /api/sessions/{id}`, which rolls
+  back a transaction left open. An engine without that endpoint gets a `ROLLBACK` for an
+  open transaction instead, and keeps the session until its own idle expiry. Either is one
+  request, bounded by the shorter of the connection's `timeout` and 5 seconds. `close()`
+  never raises, and a second `close()` sends nothing. Leaving a `with` block closes the
+  connection even when its commit fails.
 
 ## Tests
 
@@ -94,3 +142,14 @@ python3 -m unittest -v
 ```
 
 Unset `FROSTLAKE_CLASSPATH` skips the integration suite; the unit suite still runs.
+
+Set `FL_CORPUS` to the engine's testkit directory (an absolute path) and that run also
+replays the engine's language-neutral SQL corpus through the driver (`testkit_runner.py`);
+without it, `test_testkit.py` skips:
+
+```bash
+FL_CORPUS=/path/to/frostlake/engine/src/test/resources/testkit \
+JAVA_HOME=~/.jdks/liberica-17.0.18 \
+FROSTLAKE_CLASSPATH="<engine classes>:<dependency classpath>" \
+python3 -m unittest -v
+```

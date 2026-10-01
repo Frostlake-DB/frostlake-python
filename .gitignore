@@ -6,3 +6,6 @@ __pycache__/
 frostlake.egg-info/
 build/
 dist/
+
+# testkit_runner.py reports
+target/

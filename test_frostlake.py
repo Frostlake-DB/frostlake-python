@@ -6,6 +6,7 @@ Unset FROSTLAKE_CLASSPATH skips the suite.
 
 import datetime
 import decimal
+import json
 import os
 import socket
 import subprocess
@@ -137,6 +138,25 @@ class FrostlakeDriverTest(unittest.TestCase):
         scoped_cur.execute("SELECT CURRENT_DATABASE() AS d, CURRENT_SCHEMA() AS s")
         self.assertEqual([("PY_DSN_DB", "S2")], scoped_cur.fetchall())
         scoped.close()
+
+    def test_a_refused_dsn_database_keeps_failing_instead_of_falling_through(self):
+        admin = frostlake.connect(DSN)
+        admin_cur = admin.cursor()
+        admin_cur.execute("DROP DATABASE IF EXISTS py_late_db")
+        conn = frostlake.connect(DSN + "/py_late_db")
+        cur = conn.cursor()
+        # The USE the DSN asks for is refused, and stays in line: no statement runs in the
+        # server's default database instead.
+        for sql in ("SELECT 1", "SELECT CURRENT_DATABASE()"):
+            with self.assertRaises(frostlake.ProgrammingError) as caught:
+                cur.execute(sql)
+            self.assertIn("does not exist", str(caught.exception))
+        # Once the database exists, the next statement applies the USE and runs in it.
+        admin_cur.execute("CREATE DATABASE py_late_db")
+        admin.close()
+        cur.execute("SELECT CURRENT_DATABASE()")
+        self.assertEqual([("PY_LATE_DB",)], cur.fetchall())
+        conn.close()
 
     def test_connection_context_manager_commits(self):
         cur = self.conn.cursor()
@@ -613,6 +633,107 @@ class MultiStatementCountTest(unittest.TestCase):
             # nothing to refuse here. Skip rather than pass: the refusal is the point,
             # and a green tick would claim this engine was checked for it.
             self.skipTest("this engine does not enforce the statement count")
+
+
+class SessionLifetimeTest(unittest.TestCase):
+    """A session the engine no longer holds, and the release on close, against the engine."""
+
+    def setUp(self):
+        # Asked over the wire rather than of the driver: an engine that answers newSession
+        # also takes requireSession and releases sessions on DELETE.
+        probe = self.post({"sql": "SELECT 1"})
+        if "newSession" not in probe:
+            self.skipTest("this engine predates requireSession and session release")
+        self.release_out_of_band(probe["sessionId"])
+
+    def base(self):
+        return "http://127.0.0.1:%d" % PORT
+
+    def post(self, payload):
+        request = urllib.request.Request(self.base() + "/api/execute",
+                                         data=json.dumps(payload).encode("utf-8"),
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def active_sessions(self):
+        with urllib.request.urlopen(self.base() + "/api/sessions", timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))["activeSessions"]
+
+    def release_out_of_band(self, session_id):
+        request = urllib.request.Request(self.base() + "/api/sessions/" + session_id,
+                                         method="DELETE")
+        with urllib.request.urlopen(request, timeout=10) as resp:
+            self.assertEqual(200, resp.status)
+
+    def scoped(self, database, schema):
+        """A connection on a DSN naming `database` and `schema`, after its first statement."""
+        admin = frostlake.connect(DSN)
+        cur = admin.cursor()
+        cur.execute("CREATE OR REPLACE DATABASE " + database)
+        cur.execute("CREATE SCHEMA IF NOT EXISTS %s.%s" % (database, schema))
+        admin.close()
+        conn = frostlake.connect("%s/%s?schema=%s" % (DSN, database, schema))
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        return conn, cur
+
+    def test_a_session_released_out_of_band_is_replaced_on_the_dsn_scope(self):
+        conn, cur = self.scoped("py_lost_db", "s2")
+        lost = conn._session_id
+        self.release_out_of_band(lost)
+        cur.execute("SELECT CURRENT_DATABASE() AS d, CURRENT_SCHEMA() AS s")
+        self.assertEqual([("PY_LOST_DB", "S2")], cur.fetchall())
+        self.assertNotEqual(lost, conn._session_id)
+        conn.close()
+
+    def test_a_session_released_with_a_transaction_open_is_reported(self):
+        conn, cur = self.scoped("py_losttx_db", "s2")
+        cur.execute("CREATE TABLE t (a INTEGER)")
+        conn.begin()
+        cur.execute("INSERT INTO t VALUES (1)")
+        self.release_out_of_band(conn._session_id)
+        with self.assertRaises(frostlake.OperationalError) as caught:
+            cur.execute("INSERT INTO t VALUES (2)")
+        self.assertIsInstance(caught.exception, frostlake.SessionLostError)
+        self.assertIn("transaction", str(caught.exception))
+        # Still usable, on a fresh session: the release rolled the first row back, and
+        # the second never ran.
+        conn.autocommit = True
+        cur.execute("SELECT COUNT(*) FROM t")
+        self.assertEqual([(0,)], cur.fetchall())
+        conn.close()
+
+    def test_a_failed_begin_leaves_the_next_statement_committing(self):
+        conn, cur = self.scoped("py_failedbegin_db", "s2")
+        cur.execute("CREATE TABLE t (a INTEGER)")
+        cur.execute("SET marker = 1")
+        # The session goes, holding the variable, so BEGIN is refused rather than re-run.
+        self.release_out_of_band(conn._session_id)
+        self.assertRaises(frostlake.SessionLostError, conn.begin)
+        cur.execute("INSERT INTO t VALUES (1)")
+        # No transaction was opened, so the row committed on its own: a second session
+        # sees it at once, and commit() has nothing left to lose.
+        other = frostlake.connect(DSN + "/py_failedbegin_db?schema=s2")
+        other_cur = other.cursor()
+        other_cur.execute("SELECT COUNT(*) FROM t")
+        self.assertEqual([(1,)], other_cur.fetchall())
+        self.assertTrue(conn.autocommit)
+        conn.commit()
+        conn.close()
+        other_cur.execute("SELECT COUNT(*) FROM t")
+        self.assertEqual([(1,)], other_cur.fetchall())
+        other.close()
+
+    def test_closing_releases_the_session(self):
+        conn = frostlake.connect(DSN)
+        conn.cursor().execute("SELECT 1")
+        before = self.active_sessions()
+        conn.close()
+        self.assertEqual(before - 1, self.active_sessions())
+        conn.close()
+        self.assertEqual(before - 1, self.active_sessions())
 
 
 if __name__ == "__main__":

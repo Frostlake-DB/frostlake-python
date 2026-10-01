@@ -5,11 +5,13 @@ These need no server and no JVM, so they run on a bare checkout:
     python3 -m unittest test_frostlake_unit -v
 """
 
+import collections
 import datetime
 import decimal
 import http.server
 import json
 import threading
+import time
 import unittest
 
 import frostlake
@@ -653,6 +655,789 @@ class MultiStatementCountWireTest(unittest.TestCase):
             self.assertRaises(frostlake.ProgrammingError,
                               self.cur.execute, "SELECT 1", None, bad)
         self.assertEqual([], self.BODIES)
+
+
+# -- session lifetime, against a scripted engine -------------------------------
+
+class ScriptedEngine(object):
+    """A stand-in engine on a local socket: it answers each request from a script and
+    records what it was sent, so a scenario sees every round trip it makes. A request
+    the script did not expect is recorded as such and answered with a body that is not
+    an engine's, which the driver reports as an error."""
+
+    def __init__(self):
+        self.requests = []
+        self.unscripted = []
+        self._script = collections.deque()
+        self._stop = threading.Event()
+        engine = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                engine._handle(self)
+
+            do_POST = do_GET
+            do_DELETE = do_GET
+
+            def log_message(self, fmt, *args):
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._server.block_on_close = False
+        threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.05},
+                         daemon=True).start()
+        self.port = self._server.server_address[1]
+        self.dsn = "frostlake://127.0.0.1:%d" % self.port
+
+    def reply(self, body, status=200):
+        self._script.append(("reply", status, json.dumps(body)))
+
+    def reply_text(self, text, status):
+        """Answer with a body that is not JSON, the way a proxy in the way does."""
+        self._script.append(("reply", status, text))
+
+    def drop(self):
+        """Close the socket without answering."""
+        self._script.append(("drop", 0, ""))
+
+    def hang(self):
+        """Hold the request unanswered until the engine is stopped."""
+        self._script.append(("hang", 0, ""))
+
+    @property
+    def pending(self):
+        return len(self._script)
+
+    def stop(self):
+        self._stop.set()
+        self._server.shutdown()
+        self._server.server_close()
+
+    def _handle(self, handler):
+        length = int(handler.headers.get("Content-Length") or 0)
+        raw = handler.rfile.read(length) if length else b""
+        body = json.loads(raw.decode("utf-8")) if raw else None
+        self.requests.append((handler.command, handler.path, body))
+        if not self._script:
+            self.unscripted.append((handler.command, handler.path, body))
+            action = ("reply", 500, "<html>unscripted</html>")
+        else:
+            action = self._script.popleft()
+        kind, status, text = action
+        if kind == "hang":
+            self._stop.wait(30)
+        if kind != "reply":
+            handler.close_connection = True
+            return
+        payload = text.encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    # what the driver sent
+
+    def executes(self):
+        return [body for verb, path, body in self.requests if path == "/api/execute"]
+
+    def statements(self):
+        return [body["sql"] for body in self.executes()]
+
+
+def status_set():
+    return {"columns": [{"name": "status", "dataType": "VARCHAR", "precision": 0, "scale": 0,
+                         "nullable": False}],
+            "rows": [["Statement executed successfully."]], "rowCount": 1, "updateCount": -1}
+
+
+def number_set(name, value):
+    return {"columns": [{"name": name, "dataType": "NUMBER", "precision": 38, "scale": 0,
+                         "nullable": False}],
+            "rows": [[value]], "rowCount": 1, "updateCount": -1}
+
+
+def answer(session_id, started, *sets):
+    """An answer from an engine that reports newSession (0.1.0 and later)."""
+    return {"success": True, "sessionId": session_id, "newSession": started,
+            "errorMessage": None, "executionTimeMs": 1, "resultSets": list(sets)}
+
+
+def legacy_answer(session_id, *sets):
+    """An answer from an engine that predates newSession (0.0.7)."""
+    return {"success": True, "sessionId": session_id, "errorMessage": None,
+            "executionTimeMs": 1, "resultSets": list(sets)}
+
+
+def gone(session_id):
+    """The 404 a requireSession request gets when its session is gone: nothing ran."""
+    return {"success": False, "sessionId": None, "newSession": False,
+            "errorMessage": "Session '%s' does not exist or has expired." % session_id,
+            "executionTimeMs": 0, "resultSets": []}
+
+
+RELEASED = {"success": True, "sessionId": None, "newSession": False, "errorMessage": None,
+            "executionTimeMs": 0, "resultSets": []}
+
+SCOPE = ["USE DATABASE APP", "USE SCHEMA PUBLIC"]
+
+
+class SessionLifetimeTest(unittest.TestCase):
+    """How a connection keeps its idea of the engine session in step with the engine's."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def opened(self, legacy=False):
+        """A connection on the DSN's scope that has run one statement: USE DATABASE and
+        USE SCHEMA went first, the session is s1, and the engine's kind is known."""
+        if legacy:
+            for sets in ((status_set(),), (status_set(),), (number_set("N", 1),)):
+                self.engine.reply(legacy_answer("s1", *sets))
+        else:
+            self.engine.reply(answer("s1", True, status_set()))
+            self.engine.reply(answer("s1", False, status_set()))
+            self.engine.reply(answer("s1", False, number_set("N", 1)))
+        conn = frostlake.connect(self.engine.dsn + "/APP?schema=PUBLIC", timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 AS N")
+        return conn, cur
+
+    def assert_all_answered(self):
+        self.assertEqual([], self.engine.unscripted)
+        self.assertEqual(0, self.engine.pending)
+
+    def assert_session_lost(self, call, *args):
+        # Caught as the PEP 249 class first, so a driver that raises something else
+        # shows what it raised.
+        with self.assertRaises(frostlake.OperationalError) as caught:
+            call(*args)
+        self.assertIsInstance(caught.exception, frostlake.SessionLostError)
+        return caught.exception
+
+    def test_the_session_is_not_required_before_the_engine_has_said_it_can(self):
+        conn, cur = self.opened()
+        first, second, third = self.engine.executes()
+        # The first request names no session, so it has nothing to require.
+        self.assertNotIn("sessionId", first)
+        self.assertNotIn("requireSession", first)
+        # Its answer carried newSession, so from then on the session is required.
+        self.assertEqual("s1", second["sessionId"])
+        self.assertIs(True, second["requireSession"])
+        self.assertIs(True, third["requireSession"])
+        self.assertEqual(SCOPE + ["SELECT 1 AS N"], self.engine.statements())
+        self.assertEqual([(1,)], cur.fetchall())
+
+    def test_an_older_engine_is_never_sent_the_field(self):
+        conn, cur = self.opened(legacy=True)
+        self.engine.reply(legacy_answer("s1", number_set("N", 2)))
+        cur.execute("SELECT 2 AS N")
+        for body in self.engine.executes()[1:]:
+            self.assertEqual("s1", body["sessionId"])
+            self.assertNotIn("requireSession", body)
+        conn.close()
+        # No DELETE either: an engine that predates newSession has no such endpoint.
+        self.assertEqual(["POST"] * 4, [verb for verb, _, _ in self.engine.requests])
+        self.assert_all_answered()
+
+    def test_an_answer_naming_no_session_settles_nothing(self):
+        # A refusal of the request itself carries no session and says nothing about the
+        # engine; the first answer that names a session does.
+        self.engine.reply({"success": False, "sessionId": None,
+                           "errorMessage": "SQL is required"}, status=400)
+        self.engine.reply(answer("n1", True, number_set("N", 1)))
+        self.engine.reply(answer("n1", False, number_set("N", 2)))
+        conn = frostlake.connect(self.engine.dsn, timeout=5)
+        cur = conn.cursor()
+        self.assertRaises(frostlake.ProgrammingError, cur.execute, " ")
+        cur.execute("SELECT 1 AS N")
+        cur.execute("SELECT 2 AS N")
+        bodies = self.engine.executes()
+        self.assertNotIn("requireSession", bodies[1])
+        self.assertIs(True, bodies[2]["requireSession"])
+        self.assert_all_answered()
+
+    def test_a_lost_session_is_replaced_on_the_scope_and_the_statement_sent_once_more(self):
+        conn, cur = self.opened()
+        self.engine.reply(gone("s1"), status=404)
+        self.engine.reply(answer("s2", True, status_set()))
+        self.engine.reply(answer("s2", False, status_set()))
+        self.engine.reply(answer("s2", False, number_set("N", 2)))
+        cur.execute("SELECT 2 AS N")
+        self.assertEqual([(2,)], cur.fetchall())
+        self.assertEqual(SCOPE + ["SELECT 1 AS N", "SELECT 2 AS N"] + SCOPE + ["SELECT 2 AS N"],
+                         self.engine.statements())
+        bodies = self.engine.executes()
+        # The replacement starts without an id, and everything after it names the new one.
+        self.assertNotIn("sessionId", bodies[4])
+        self.assertEqual(["s2", "s2"], [bodies[5]["sessionId"], bodies[6]["sessionId"]])
+        self.assertEqual("s2", conn._session_id)
+        self.assert_all_answered()
+
+    def test_a_second_404_is_reported_rather_than_retried(self):
+        conn, cur = self.opened()
+        self.engine.reply(gone("s1"), status=404)
+        self.engine.reply(answer("s2", True, status_set()))
+        self.engine.reply(answer("s2", False, status_set()))
+        self.engine.reply(gone("s2"), status=404)
+        self.assert_session_lost(cur.execute, "SELECT 2 AS N")
+        self.assertEqual(2, self.engine.statements().count("SELECT 2 AS N"))
+        self.assert_all_answered()
+
+    def test_a_lost_session_with_an_open_transaction_is_reported_not_replaced(self):
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", False, status_set()))
+        conn.begin()
+        self.engine.reply(gone("s1"), status=404)
+        error = self.assert_session_lost(cur.execute, "INSERT INTO T VALUES (1)")
+        self.assertIn("transaction", str(error))
+        self.assertEqual(SCOPE + ["SELECT 1 AS N", "BEGIN", "INSERT INTO T VALUES (1)"],
+                         self.engine.statements())
+        # The connection stays usable: the next statement starts a fresh session on the
+        # scope, and with autocommit still off it opens a transaction there first.
+        self.engine.reply(answer("s2", True, status_set()))
+        self.engine.reply(answer("s2", False, status_set()))
+        self.engine.reply(answer("s2", False, status_set()))
+        self.engine.reply(answer("s2", False, number_set("N", 3)))
+        cur.execute("SELECT 3 AS N")
+        self.assertEqual(SCOPE + ["BEGIN", "SELECT 3 AS N"], self.engine.statements()[5:])
+        self.assertNotIn("sessionId", self.engine.executes()[5])
+        self.assert_all_answered()
+
+    def test_a_commit_that_finds_the_session_gone_says_the_transaction_went_with_it(self):
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("number of rows inserted", 1)))
+        conn.begin()
+        cur.execute("INSERT INTO T VALUES (1)")
+        self.engine.reply(gone("s1"), status=404)
+        error = self.assert_session_lost(conn.commit)
+        self.assertIn("transaction", str(error))
+        # The COMMIT was not sent again on a fresh session, where it would have
+        # "succeeded" with nothing to commit.
+        self.assertEqual(1, self.engine.statements().count("COMMIT"))
+        self.assert_all_answered()
+
+    def test_a_transaction_opened_by_a_statement_is_tracked_too(self):
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", False, status_set()))
+        cur.execute("BEGIN TRANSACTION")
+        self.engine.reply(gone("s1"), status=404)
+        error = self.assert_session_lost(cur.execute, "INSERT INTO T VALUES (1)")
+        self.assertIn("transaction", str(error))
+        self.assert_all_answered()
+
+    def test_a_lost_session_whose_context_moved_is_reported_not_replaced(self):
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", False, status_set()))
+        cur.execute("USE SCHEMA OTHER")
+        self.engine.reply(gone("s1"), status=404)
+        error = self.assert_session_lost(cur.execute, "SELECT * FROM T")
+        self.assertIn("context", str(error))
+        self.assertEqual(SCOPE + ["SELECT 1 AS N", "USE SCHEMA OTHER", "SELECT * FROM T"],
+                         self.engine.statements())
+        # Starting over on the scope puts the connection back where it began.
+        self.engine.reply(answer("s2", True, status_set()))
+        self.engine.reply(answer("s2", False, status_set()))
+        self.engine.reply(answer("s2", False, number_set("N", 4)))
+        cur.execute("SELECT 4 AS N")
+        self.assertEqual(SCOPE + ["SELECT 4 AS N"], self.engine.statements()[5:])
+        self.assert_all_answered()
+
+    def test_session_state_is_noticed_anywhere_in_a_request(self):
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", False, number_set("N", 1), status_set()))
+        cur.execute("SELECT 1 AS N; SET v = 1", num_statements=2)
+        self.engine.reply(gone("s1"), status=404)
+        self.assert_session_lost(cur.execute, "SELECT $v")
+        self.assert_all_answered()
+
+    def test_a_server_that_replaced_the_session_gets_the_scope_back_first(self):
+        # An engine that ran a statement in a fresh session in place of ours says so;
+        # the scope goes back on before the next statement.
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", True, number_set("N", 2)))
+        cur.execute("SELECT 2 AS N")
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("N", 3)))
+        cur.execute("SELECT 3 AS N")
+        self.assertEqual(SCOPE + ["SELECT 3 AS N"], self.engine.statements()[4:])
+        self.assert_all_answered()
+
+    def test_closing_releases_the_session_once(self):
+        conn, cur = self.opened()
+        self.engine.reply(RELEASED)
+        conn.close()
+        verb, path, body = self.engine.requests[-1]
+        self.assertEqual(("DELETE", "/api/sessions/s1", None), (verb, path, body))
+        count = len(self.engine.requests)
+        conn.close()
+        self.assertEqual(count, len(self.engine.requests))
+        self.assertRaises(frostlake.InterfaceError, cur.execute, "SELECT 1")
+        self.assert_all_answered()
+
+    def test_closing_a_connection_that_never_ran_anything_sends_nothing(self):
+        conn = frostlake.connect(self.engine.dsn + "/APP", timeout=5)
+        conn.close()
+        self.assertEqual([], self.engine.requests)
+
+    def test_closing_with_a_transaction_open_leaves_the_rollback_to_the_release(self):
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", False, status_set()))
+        conn.begin()
+        self.engine.reply(RELEASED)
+        conn.close()
+        self.assertEqual("DELETE", self.engine.requests[-1][0])
+        self.assertNotIn("ROLLBACK", self.engine.statements())
+        self.assert_all_answered()
+
+    def test_closing_on_an_older_engine_rolls_back_an_open_transaction_instead(self):
+        conn, cur = self.opened(legacy=True)
+        self.engine.reply(legacy_answer("s1", status_set()))
+        conn.begin()
+        self.engine.reply(legacy_answer("s1", status_set()))
+        conn.close()
+        self.assertEqual("ROLLBACK", self.engine.statements()[-1])
+        self.assertEqual(["POST"] * 5, [verb for verb, _, _ in self.engine.requests])
+        self.assert_all_answered()
+
+    def test_closing_never_raises(self):
+        refusals = (
+            lambda: self.engine.reply(gone("s1"), status=404),
+            lambda: self.engine.reply({"error": "Method not allowed"}, status=405),
+            self.engine.drop,
+        )
+        for script in refusals:
+            conn, cur = self.opened()
+            script()
+            conn.close()
+            self.assertEqual("DELETE", self.engine.requests[-1][0])
+            self.assert_all_answered()
+            del self.engine.requests[:]
+
+    def test_closing_is_bounded_when_the_engine_does_not_answer(self):
+        self.engine.reply(answer("s1", True, number_set("N", 1)))
+        conn = frostlake.connect(self.engine.dsn, timeout=0.5)
+        conn.cursor().execute("SELECT 1 AS N")
+        self.engine.hang()
+        started = time.monotonic()
+        conn.close()
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual("DELETE", self.engine.requests[-1][0])
+
+    def test_closing_after_the_engine_went_away_does_not_raise(self):
+        conn, cur = self.opened()
+        self.engine.stop()
+        conn.close()
+
+    def test_a_scope_statement_the_engine_refuses_names_itself(self):
+        self.engine.reply(answer("s1", True, status_set()))
+        self.engine.reply({"success": False, "sessionId": "s1", "newSession": False,
+                           "errorMessage": "Schema 'NOPE' does not exist or not authorized.",
+                           "resultSets": []})
+        conn = frostlake.connect(self.engine.dsn + "/APP?schema=NOPE", timeout=5)
+        with self.assertRaises(frostlake.ProgrammingError) as caught:
+            conn.cursor().execute("SELECT 1")
+        self.assertEqual("USE SCHEMA NOPE", caught.exception.statement)
+        self.assertEqual(["USE DATABASE APP", "USE SCHEMA NOPE"], self.engine.statements())
+        self.assert_all_answered()
+
+
+def refused(session_id, message, started=False):
+    """A statement the engine ran and refused: it names the session it ran in."""
+    return {"success": False, "sessionId": session_id, "newSession": started,
+            "errorMessage": message, "executionTimeMs": 0, "resultSets": []}
+
+
+NO_SUCH_OBJECT = "SQL compilation error:\nObject does not exist, or operation cannot be performed."
+
+
+class RefusedScopeTest(unittest.TestCase):
+    """A USE of the DSN's that the engine refuses stays in line, so nothing runs past it
+    in the server's default database."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def assert_all_answered(self):
+        self.assertEqual([], self.engine.unscripted)
+        self.assertEqual(0, self.engine.pending)
+
+    def test_a_refused_use_keeps_failing_instead_of_falling_through(self):
+        self.engine.reply(refused("s1", NO_SUCH_OBJECT, started=True))
+        self.engine.reply(refused("s1", NO_SUCH_OBJECT))
+        conn = frostlake.connect(self.engine.dsn + "/NOPE?schema=PUBLIC", timeout=5)
+        cur = conn.cursor()
+        with self.assertRaises(frostlake.ProgrammingError) as first:
+            cur.execute("SELECT 1")
+        with self.assertRaises(frostlake.ProgrammingError) as second:
+            cur.execute("SELECT CURRENT_DATABASE()")
+        # Neither statement reached the engine: each met the refused USE first.
+        self.assertEqual(["USE DATABASE NOPE", "USE DATABASE NOPE"], self.engine.statements())
+        for caught in (first, second):
+            self.assertIn("does not exist", str(caught.exception))
+            self.assertEqual("USE DATABASE NOPE", caught.exception.statement)
+        # Once the engine takes it (the database was created meanwhile), the rest of the
+        # scope follows, and then the statement.
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("N", 1)))
+        cur.execute("SELECT 1 AS N")
+        self.assertEqual([(1,)], cur.fetchall())
+        self.assertEqual(["USE DATABASE NOPE"] * 3 + ["USE SCHEMA PUBLIC", "SELECT 1 AS N"],
+                         self.engine.statements())
+        self.assert_all_answered()
+
+    def test_the_scope_picks_up_at_the_refused_statement(self):
+        self.engine.reply(answer("s1", True, status_set()))
+        self.engine.reply(refused("s1", NO_SUCH_OBJECT))
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("N", 1)))
+        conn = frostlake.connect(self.engine.dsn + "/APP?schema=NOPE", timeout=5)
+        cur = conn.cursor()
+        self.assertRaises(frostlake.ProgrammingError, cur.execute, "SELECT 1 AS N")
+        cur.execute("SELECT 1 AS N")
+        # USE DATABASE took and is not sent again; the refused USE SCHEMA is.
+        self.assertEqual(["USE DATABASE APP", "USE SCHEMA NOPE", "USE SCHEMA NOPE",
+                          "SELECT 1 AS N"], self.engine.statements())
+        self.assert_all_answered()
+
+    def test_a_session_replaced_while_the_scope_goes_on_gets_all_of_it(self):
+        # An older engine's answer, then one saying the engine ran USE SCHEMA in a fresh
+        # session in place of ours: the fresh one gets the whole scope, database first.
+        self.engine.reply(legacy_answer("s1", status_set()))
+        self.engine.reply(answer("s1", True, status_set()))
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("N", 1)))
+        conn = frostlake.connect(self.engine.dsn + "/APP?schema=PUBLIC", timeout=5)
+        conn.cursor().execute("SELECT 1 AS N")
+        self.assertEqual(SCOPE + SCOPE + ["SELECT 1 AS N"], self.engine.statements())
+        self.assert_all_answered()
+
+    def test_begin_opens_no_transaction_past_a_refused_use(self):
+        self.engine.reply(refused("s1", NO_SUCH_OBJECT, started=True))
+        self.engine.reply(refused("s1", NO_SUCH_OBJECT))
+        conn = frostlake.connect(self.engine.dsn + "/NOPE", timeout=5)
+        self.assertRaises(frostlake.ProgrammingError, conn.begin)
+        conn.autocommit = False
+        self.assertRaises(frostlake.ProgrammingError,
+                          conn.cursor().execute, "INSERT INTO T VALUES (1)")
+        # Neither BEGIN nor the INSERT went out ahead of the scope.
+        self.assertEqual(["USE DATABASE NOPE", "USE DATABASE NOPE"], self.engine.statements())
+        self.assert_all_answered()
+
+
+class FailedBeginTest(unittest.TestCase):
+    """A BEGIN that did not take changes nothing: autocommit stays as it was, and a BEGIN
+    still owed goes out again before the next statement."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def assert_all_answered(self):
+        self.assertEqual([], self.engine.unscripted)
+        self.assertEqual(0, self.engine.pending)
+
+    def opened(self, dsn=""):
+        self.engine.reply(answer("s1", True, number_set("N", 1)))
+        conn = frostlake.connect(self.engine.dsn + dsn, timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 AS N")
+        return conn, cur
+
+    def bodies_of(self, sql):
+        return [body for body in self.engine.executes() if body["sql"] == sql]
+
+    def assert_begin_left_autocommit_on(self, conn, cur):
+        self.engine.reply(answer("s1", False, number_set("number of rows inserted", 1)))
+        cur.execute("INSERT INTO T VALUES (1)")
+        # The row commits on its own, so commit() has nothing left to send.
+        self.assertIs(True, self.bodies_of("INSERT INTO T VALUES (1)")[-1]["autoCommit"],
+                      "the INSERT went out inside a transaction nobody opened")
+        self.assertTrue(conn.autocommit)
+        conn.commit()
+        self.assertNotIn("COMMIT", self.engine.statements())
+        for body in self.bodies_of("BEGIN"):
+            self.assertIs(False, body["autoCommit"])
+        self.assert_all_answered()
+
+    def test_commit_after_a_refused_begin_leaves_no_work_uncommitted(self):
+        conn, cur = self.opened()
+        self.engine.reply(refused("s1", "SQL compilation error:\nno transactions today"))
+        self.assertRaises(frostlake.ProgrammingError, conn.begin)
+        self.assert_begin_left_autocommit_on(conn, cur)
+
+    def test_an_unreadable_answer_to_begin_leaves_autocommit_on(self):
+        conn, cur = self.opened()
+        self.engine.reply_text("<html><body>502 Bad Gateway</body></html>", 502)
+        self.assertRaises(frostlake.OperationalError, conn.begin)
+        self.assert_begin_left_autocommit_on(conn, cur)
+
+    def test_a_hang_up_on_begin_leaves_autocommit_on(self):
+        conn, cur = self.opened()
+        self.engine.drop()
+        self.assertRaises(frostlake.OperationalError, conn.begin)
+        self.assert_begin_left_autocommit_on(conn, cur)
+
+    def test_a_refused_use_ahead_of_begin_leaves_autocommit_on(self):
+        self.engine.reply(refused("s1", NO_SUCH_OBJECT, started=True))
+        conn = frostlake.connect(self.engine.dsn + "/NOPE", timeout=5)
+        cur = conn.cursor()
+        self.assertRaises(frostlake.ProgrammingError, conn.begin)
+        self.assertTrue(conn.autocommit)
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("number of rows inserted", 1)))
+        cur.execute("INSERT INTO T VALUES (1)")
+        self.assertEqual(["USE DATABASE NOPE", "USE DATABASE NOPE", "INSERT INTO T VALUES (1)"],
+                         self.engine.statements())
+        self.assertEqual([True, True], [b["autoCommit"] for b in self.engine.executes()[1:]])
+        self.assert_all_answered()
+
+    def test_a_begin_whose_lost_session_held_context_leaves_autocommit_on(self):
+        conn, cur = self.opened()
+        self.engine.reply(answer("s1", False, status_set()))
+        cur.execute("SET marker = 1")
+        self.engine.reply(gone("s1"), status=404)
+        self.assertRaises(frostlake.SessionLostError, conn.begin)
+        self.assertTrue(conn.autocommit)
+        # The next statement starts a fresh session with no transaction on it.
+        self.engine.reply(answer("s2", True, number_set("number of rows inserted", 1)))
+        cur.execute("INSERT INTO T VALUES (1)")
+        self.assertEqual(["SELECT 1 AS N", "SET marker = 1", "BEGIN", "INSERT INTO T VALUES (1)"],
+                         self.engine.statements())
+        self.assertIs(True, self.engine.executes()[-1]["autoCommit"])
+        self.assert_all_answered()
+
+    def test_a_pending_begin_that_failed_goes_out_again_first(self):
+        conn, cur = self.opened()
+        conn.autocommit = False
+        self.engine.reply(refused("s1", "SQL compilation error:\nno transactions today"))
+        self.assertRaises(frostlake.ProgrammingError, cur.execute, "INSERT INTO T VALUES (1)")
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("number of rows inserted", 1)))
+        self.engine.reply(answer("s1", False, status_set()))
+        cur.execute("INSERT INTO T VALUES (2)")
+        conn.commit()
+        # The second INSERT ran inside the BEGIN it was owed, and commit() committed it.
+        self.assertEqual(["SELECT 1 AS N", "BEGIN", "BEGIN", "INSERT INTO T VALUES (2)", "COMMIT"],
+                         self.engine.statements())
+        self.assert_all_answered()
+
+
+class AutocommitBackOnTest(unittest.TestCase):
+    """Turning autocommit back on leaves no BEGIN owed, whatever its COMMIT meets."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def opened(self):
+        self.engine.reply(answer("s1", True, number_set("N", 1)))
+        conn = frostlake.connect(self.engine.dsn, timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 AS N")
+        return conn, cur
+
+    def refuse_commit(self):
+        # A refused COMMIT is followed by a ROLLBACK of the transaction nobody chose.
+        self.engine.reply(refused("s1", "SQL compilation error:\nnot now"))
+        self.engine.reply(answer("s1", False, status_set()))
+
+    def failures(self):
+        """How the COMMIT can fail, what the driver sends after it, the session the next
+        statement then runs in, and the error the caller sees."""
+        return (
+            (self.refuse_commit, ["ROLLBACK"], "s1", frostlake.ProgrammingError),
+            (self.engine.drop, [], "s1", frostlake.OperationalError),
+            (lambda: self.engine.reply(gone("s1"), status=404), [], "s2",
+             frostlake.SessionLostError),
+        )
+
+    def assert_next_statement_commits_on_its_own(self, cur, session_id, before):
+        self.engine.reply(answer(session_id, session_id != "s1",
+                                 number_set("number of rows inserted", 1)))
+        try:
+            cur.execute("INSERT INTO T VALUES (2)")
+        except frostlake.Error:
+            pass  # what went out, checked next, says why
+        # No BEGIN went out ahead of it, and it went out with autocommit on.
+        self.assertEqual(before + ["INSERT INTO T VALUES (2)"], self.engine.statements())
+        self.assertIs(True, self.engine.executes()[-1]["autoCommit"])
+        self.assertEqual([], self.engine.unscripted)
+        self.assertEqual(0, self.engine.pending)
+
+    def test_a_failed_commit_turning_autocommit_on_leaves_the_next_statement_committing(self):
+        for fail, after_commit, session_id, error in self.failures():
+            conn, cur = self.opened()
+            conn.autocommit = False
+            self.engine.reply(answer("s1", False, status_set()))
+            self.engine.reply(answer("s1", False, number_set("number of rows inserted", 1)))
+            cur.execute("INSERT INTO T VALUES (1)")
+            fail()
+            self.assertRaises(error, setattr, conn, "autocommit", True)
+            self.assertTrue(conn.autocommit)
+            self.assert_next_statement_commits_on_its_own(
+                cur, session_id,
+                ["SELECT 1 AS N", "BEGIN", "INSERT INTO T VALUES (1)", "COMMIT"] + after_commit)
+            del self.engine.requests[:]
+
+    def test_a_begin_armed_inside_a_transaction_is_dropped_when_autocommit_comes_back_on(self):
+        for fail, after_commit, session_id, error in self.failures():
+            conn, cur = self.opened()
+            self.engine.reply(answer("s1", False, status_set()))
+            cur.execute("BEGIN")
+            # Turning autocommit off inside that transaction arms a BEGIN for the next one.
+            conn.autocommit = False
+            fail()
+            self.assertRaises(error, setattr, conn, "autocommit", True)
+            self.assertTrue(conn.autocommit)
+            self.assert_next_statement_commits_on_its_own(
+                cur, session_id, ["SELECT 1 AS N", "BEGIN", "COMMIT"] + after_commit)
+            del self.engine.requests[:]
+
+
+class FailedCommitTest(unittest.TestCase):
+    """With autocommit off, a COMMIT or ROLLBACK that failed still leaves the next
+    statement inside a transaction that commit() reaches."""
+
+    def setUp(self):
+        self.engine = ScriptedEngine()
+
+    def tearDown(self):
+        self.engine.stop()
+
+    def in_transaction(self):
+        """A connection with autocommit off that has run one INSERT inside its BEGIN."""
+        self.engine.reply(answer("s1", True, number_set("N", 1)))
+        self.engine.reply(answer("s1", False, status_set()))
+        self.engine.reply(answer("s1", False, number_set("number of rows inserted", 1)))
+        conn = frostlake.connect(self.engine.dsn, timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT 1 AS N")
+        conn.autocommit = False
+        cur.execute("INSERT INTO T VALUES (1)")
+        return conn, cur
+
+    def run_next(self, conn, cur, session_id, opens_one):
+        """INSERT 2, then commit(): the replies they need, the INSERT with a fresh BEGIN
+        ahead of it when `opens_one`."""
+        if opens_one:
+            self.engine.reply(answer(session_id, session_id != "s1", status_set()))
+        self.engine.reply(answer(session_id, False, number_set("number of rows inserted", 1)))
+        self.engine.reply(answer(session_id, False, status_set()))
+        try:
+            cur.execute("INSERT INTO T VALUES (2)")
+            conn.commit()
+        except frostlake.Error:
+            pass  # what went out, checked next, says why
+
+    def assert_sent(self, expected, label):
+        self.assertEqual(["SELECT 1 AS N", "BEGIN", "INSERT INTO T VALUES (1)"] + expected,
+                         self.engine.statements(), label)
+        self.assertEqual([], self.engine.unscripted, label)
+        self.assertEqual(0, self.engine.pending, label)
+        del self.engine.requests[:]
+
+    def test_a_refused_commit_is_rolled_back_and_the_next_statement_opens_a_transaction(self):
+        rollbacks = (
+            ("the ROLLBACK taken", lambda: self.engine.reply(answer("s1", False, status_set()))),
+            ("the ROLLBACK lost", self.engine.drop),
+        )
+        for label, rollback in rollbacks:
+            conn, cur = self.in_transaction()
+            self.engine.reply(refused("s1", "SQL compilation error:\nnot now"))
+            rollback()
+            with self.assertRaises(frostlake.ProgrammingError) as caught:
+                conn.commit()
+            self.assertIn("not now", str(caught.exception), label)
+            self.run_next(conn, cur, "s1", opens_one=True)
+            self.assert_sent(["COMMIT", "ROLLBACK", "BEGIN", "INSERT INTO T VALUES (2)", "COMMIT"],
+                             label)
+
+    def test_a_commit_whose_answer_never_came_keeps_the_transaction_open(self):
+        failures = (
+            ("hang-up", self.engine.drop),
+            ("unreadable", lambda: self.engine.reply_text("<html>502 Bad Gateway</html>", 502)),
+        )
+        for label, fail in failures:
+            conn, cur = self.in_transaction()
+            fail()
+            self.assertRaises(frostlake.OperationalError, conn.commit)
+            # The next INSERT joins the open transaction, and commit() sends COMMIT again.
+            self.run_next(conn, cur, "s1", opens_one=False)
+            self.assertIs(False, self.engine.executes()[-2]["autoCommit"], label)
+            self.assert_sent(["COMMIT", "INSERT INTO T VALUES (2)", "COMMIT"], label)
+
+    def test_a_commit_that_finds_the_session_gone_leaves_a_fresh_transaction_next(self):
+        conn, cur = self.in_transaction()
+        self.engine.reply(gone("s1"), status=404)
+        self.assertRaises(frostlake.SessionLostError, conn.commit)
+        self.run_next(conn, cur, "s2", opens_one=True)
+        self.assert_sent(["COMMIT", "BEGIN", "INSERT INTO T VALUES (2)", "COMMIT"], "lost")
+
+    def test_a_failed_rollback_leaves_a_fresh_transaction_next(self):
+        failures = (
+            ("refused", lambda: self.engine.reply(refused("s1", "SQL compilation error:\nno")),
+             frostlake.ProgrammingError),
+            ("hang-up", self.engine.drop, frostlake.OperationalError),
+        )
+        for label, fail, error in failures:
+            conn, cur = self.in_transaction()
+            fail()
+            self.assertRaises(error, conn.rollback)
+            self.run_next(conn, cur, "s1", opens_one=True)
+            self.assert_sent(["ROLLBACK", "BEGIN", "INSERT INTO T VALUES (2)", "COMMIT"], label)
+
+
+class SessionTrackingTest(unittest.TestCase):
+    """Which statements the driver reads as moving the session or its transaction."""
+
+    def test_requests_split_on_top_level_semicolons_only(self):
+        self.assertEqual(["SELECT 1", " SELECT ';'", ' SELECT ";"'],
+                         frostlake._split_statements("SELECT 1; SELECT ';'; SELECT \";\";"))
+        self.assertEqual(1, len(frostlake._split_statements(
+            "EXECUTE IMMEDIATE $$ SELECT 1; SELECT 2; $$")))
+        self.assertEqual(2, len(frostlake._split_statements("SELECT 1 -- a; b\n; SELECT 2")))
+
+    def test_leading_words_skip_comments_and_fold_case(self):
+        self.assertEqual(["CREATE", "OR", "REPLACE"], frostlake._leading_words(
+            "/* c */ -- x\n create or replace table t", 3))
+
+    def test_which_statements_leave_session_state_behind(self):
+        moving = ("USE SCHEMA s", "use database d", "SET x = 1", "UNSET x",
+                  "ALTER SESSION SET TIMEZONE = 'UTC'", "CREATE OR REPLACE DATABASE d",
+                  "CREATE SCHEMA IF NOT EXISTS s", "DROP DATABASE d",
+                  "CREATE TEMPORARY TABLE t (a INT)", "CREATE OR REPLACE TEMP TABLE t (a INT)",
+                  "CREATE LOCAL TEMPORARY TABLE t (a INT)")
+        staying = ("CREATE TABLE t (a INT)", "CREATE OR REPLACE TRANSIENT TABLE t (a INT)",
+                   "ALTER TABLE t ADD COLUMN b INT", "SELECT 1", "INSERT INTO t VALUES (1)")
+        for sql in moving:
+            self.assertTrue(frostlake._touches_session(sql), sql)
+        for sql in staying:
+            self.assertFalse(frostlake._touches_session(sql), sql)
+
+    def test_transaction_control_is_recognised_and_a_scripting_block_is_not(self):
+        cases = (("BEGIN", "begins"), ("begin transaction", "begins"), ("BEGIN WORK", "begins"),
+                 ("BEGIN NAME t1", "begins"), ("START TRANSACTION", "begins"),
+                 ("COMMIT", "ends"), ("ROLLBACK WORK", "ends"),
+                 ("BEGIN LET x := 1; RETURN x; END", None), ("SELECT 1", None))
+        for sql, expected in cases:
+            first = frostlake._split_statements(sql)[0]
+            self.assertEqual(expected, frostlake._transaction_effect(first), sql)
 
 
 if __name__ == "__main__":
