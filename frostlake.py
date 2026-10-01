@@ -35,7 +35,7 @@ import urllib.error as _urlerror
 import urllib.parse as _urlparse
 import urllib.request as _urlrequest
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 apilevel = "2.0"
 threadsafety = 1
