@@ -35,7 +35,7 @@ import urllib.error as _urlerror
 import urllib.parse as _urlparse
 import urllib.request as _urlrequest
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 apilevel = "2.0"
 threadsafety = 1
@@ -934,11 +934,11 @@ def _format_literal(value):
     if value is False:
         return "false"
     if isinstance(value, int):
-        return str(value)
+        return _number_literal(str(value))
     if isinstance(value, float):
-        return repr(value)
+        return _number_literal(repr(value))
     if isinstance(value, _decimal.Decimal):
-        return str(value)
+        return _number_literal(str(value))
     if isinstance(value, str):
         return _encode_string(value)
     if isinstance(value, (bytes, bytearray)):
@@ -952,6 +952,13 @@ def _format_literal(value):
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_format_literal(v) for v in value) + "]"
     raise ProgrammingError("unsupported parameter type %r" % type(value))
+
+
+def _number_literal(text):
+    """A negative number goes in parentheses, which is one value wherever it lands: bare,
+    3-? would become 3--5, a line comment, and ?::VARCHAR would cast before it negates.
+    The rendered text decides, so a float negative zero, written -0.0, is wrapped too."""
+    return "(" + text + ")" if text.startswith("-") else text
 
 
 def _substitute(sql, parameters):
@@ -983,6 +990,12 @@ def _substitute(sql, parameters):
             i = j
         elif ch == "/" and sql.startswith("//", i):
             j = _skip_line(sql, i)
+            out.append(sql[i:j])
+            i = j
+        elif ch in _NAME_START:
+            # A name is read whole, as the lexer reads one: the $$ in a$$b opens no
+            # dollar-quoted body.
+            j = _skip_name(sql, i)
             out.append(sql[i:j])
             i = j
         elif ch == "$" and sql.startswith("$$", i):
@@ -1031,9 +1044,25 @@ def _skip_quoted(s, i, q):
     return j
 
 
+_LINE_END = _re.compile(r"[\r\n]")
+
+
 def _skip_line(s, i):
-    j = s.find("\n", i)
-    return len(s) if j < 0 else j + 1
+    """Index just past the line end that closes the line comment starting at `i`. It
+    ends at a line feed or a carriage return, whichever comes first, as the lexer's
+    LINE_COMMENT does: ('--' | '//') ~[\\r\\n]*."""
+    end = _LINE_END.search(s, i)
+    return len(s) if end is None else end.end()
+
+
+_NAME_START = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_")
+_NAME = _re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
+
+def _skip_name(s, i):
+    """Index just past the name starting at `i`, read as the lexer reads an IDENTIFIER:
+    [a-zA-Z_][a-zA-Z0-9_$]*."""
+    return _NAME.match(s, i).end()
 
 
 def _skip_dollar_quoted(s, i):
@@ -1065,6 +1094,9 @@ def _skip_non_code(sql, i):
     """Index just past the literal, quoted identifier, $$ body or comment starting at
     `i`, or -1 when `i` is code: the constructs _substitute steps over."""
     ch = sql[i]
+    # A name holds no separator, and the $$ inside one opens no body.
+    if ch in _NAME_START:
+        return _skip_name(sql, i)
     if ch == "'":
         return _skip_string(sql, i)
     if ch == '"':

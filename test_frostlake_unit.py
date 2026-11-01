@@ -241,6 +241,23 @@ class ParameterBindingTest(unittest.TestCase):
         self.assertEqual("SELECT 1 -- ?\n", frostlake._substitute("SELECT ? -- ?\n", (1,)))
         self.assertEqual("SELECT 1 /* ? */", frostlake._substitute("SELECT ? /* ? */", (1,)))
 
+    def test_a_negative_number_binds_in_parentheses(self):
+        # Bare, 3-? became 3--5, a line comment, and ?::VARCHAR cast before it negated.
+        self.assertEqual("SELECT 3-(-5)", frostlake._substitute("SELECT 3-?", (-5,)))
+        self.assertEqual("SELECT (-5)::VARCHAR",
+                         frostlake._substitute("SELECT ?::VARCHAR", (-5,)))
+        self.assertEqual("SELECT 3-5", frostlake._substitute("SELECT 3-?", (5,)))
+
+    def test_every_kind_of_negative_number_is_parenthesised(self):
+        self.assertEqual("(-2.5)", frostlake._format_literal(-2.5))
+        self.assertEqual("(-2.5)", frostlake._format_literal(decimal.Decimal("-2.5")))
+        self.assertEqual("(-123456789012345678901234567890)",
+                         frostlake._format_literal(-123456789012345678901234567890))
+        # The rendered text decides: -0.0 is not below zero, yet bare it would read 3--0.0.
+        self.assertEqual("(-0.0)", frostlake._format_literal(-0.0))
+        self.assertEqual("(-0)", frostlake._format_literal(decimal.Decimal("-0")))
+        self.assertEqual("[(-1), 2]", frostlake._format_literal([-1, 2]))
+
     def test_too_few_parameters_is_reported(self):
         self.assertRaises(frostlake.ProgrammingError,
                           frostlake._substitute, "SELECT ?, ?", (1,))
@@ -286,6 +303,13 @@ class SqlScannerTest(unittest.TestCase):
 
     def test_double_slash_comments_are_skipped(self):
         self.assertEqual("SELECT 1 // ?\n", frostlake._substitute("SELECT ? // ?\n", (1,)))
+
+    def test_a_line_comment_ends_at_a_carriage_return(self):
+        # As in the lexer, a line comment ends at a CR or an LF, whichever comes first.
+        self.assertEqual("SELECT 1 -- c\r, 7",
+                         frostlake._substitute("SELECT 1 -- c\r, ?", (7,)))
+        self.assertEqual("SELECT 1 // c\r, 7",
+                         frostlake._substitute("SELECT 1 // c\r, ?", (7,)))
 
     def test_unterminated_block_comment_swallows_the_rest(self):
         self.assertEqual("SELECT 1 /* ?", frostlake._substitute("SELECT ? /* ?", (1,)))
@@ -334,6 +358,11 @@ class DollarQuotedTest(unittest.TestCase):
 
     def test_a_lone_dollar_is_ordinary(self):
         self.assertEqual("SELECT $col, 1", frostlake._substitute("SELECT $col, ?", (1,)))
+
+    def test_dollars_inside_a_name_open_no_body(self):
+        # The lexer reads a name whole, [a-zA-Z_][a-zA-Z0-9_$]*, so a$$b is one name.
+        self.assertEqual("SELECT 1 AS a$$b, 7",
+                         frostlake._substitute("SELECT 1 AS a$$b, ?", (7,)))
 
 
 class QuoteIdentifierTest(unittest.TestCase):
@@ -1416,6 +1445,14 @@ class SessionTrackingTest(unittest.TestCase):
     def test_leading_words_skip_comments_and_fold_case(self):
         self.assertEqual(["CREATE", "OR", "REPLACE"], frostlake._leading_words(
             "/* c */ -- x\n create or replace table t", 3))
+
+    def test_the_splitter_reads_names_and_line_ends_as_the_lexer_does(self):
+        self.assertEqual(["SELECT 1 AS a$$b", " SELECT 2"],
+                         frostlake._split_statements("SELECT 1 AS a$$b; SELECT 2"))
+        self.assertEqual(["SELECT 1 -- c\r", " SELECT 2"],
+                         frostlake._split_statements("SELECT 1 -- c\r; SELECT 2"))
+        self.assertEqual(["USE", "DATABASE", "X"],
+                         frostlake._leading_words("-- c\ruse database x", 3))
 
     def test_which_statements_leave_session_state_behind(self):
         moving = ("USE SCHEMA s", "use database d", "SET x = 1", "UNSET x",
